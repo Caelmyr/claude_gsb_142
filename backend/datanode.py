@@ -97,22 +97,26 @@ class DataNode:
     # ==================================================================
     def _persist_state(self, force=False):
         with self._state_lock:
-            if not self._state_dirty and not force:
-                return
-            self.counters = {k: self.io.get(k, 0) for k in
-                             ("reads", "writes", "bytes_read", "bytes_written",
-                              "replicate_in", "replicate_out", "scrubbed",
-                              "corrupt_found")}
-            payload = {
-                "node_id": self.node_id,
-                "vv": self.vv,
-                "doc_vv": self.doc_vv,
-                "counters": self.counters,
-                "blocks": self.index,
-                "updated_at": now(),
-            }
-            atomic_write_json(self.state_path, payload)   # 原子写
-            self._state_dirty = False
+            self._persist_state_locked(force)
+
+    def _persist_state_locked(self, force=False):
+        """落盘 node_state.json，调用方必须已持有 _state_lock。"""
+        if not self._state_dirty and not force:
+            return
+        self.counters = {k: self.io.get(k, 0) for k in
+                         ("reads", "writes", "bytes_read", "bytes_written",
+                          "replicate_in", "replicate_out", "scrubbed",
+                          "corrupt_found")}
+        payload = {
+            "node_id": self.node_id,
+            "vv": self.vv,
+            "doc_vv": self.doc_vv,
+            "counters": self.counters,
+            "blocks": self.index,
+            "updated_at": now(),
+        }
+        atomic_write_json(self.state_path, payload)   # 原子写
+        self._state_dirty = False
 
     def _touch_state(self):
         """本地状态变更：推进版本向量分量 + 标脏。"""
@@ -255,7 +259,11 @@ class DataNode:
             self.write_rate.hit(to_rate_units(len(data),
                                               config.IO_RATE_SCALE))
             self._touch_state()
-        self._persist_state()
+            # 在同一把索引锁内原子落盘：保证全量块汇报要么看到
+            # 「索引与磁盘都已含本块」，要么都不含——绝不在汇报窗口中
+            # 暴露「磁盘有新块但索引仍旧」的中间态（否则 NN 会按
+            # 缺报告把新登记的副本误删，写后立即丢失副本记录）。
+            self._persist_state_locked()
         return self.index[bid]
 
     def read_block(self, bid, start=None, end=None, verify=True):

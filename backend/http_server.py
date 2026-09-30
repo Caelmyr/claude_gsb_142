@@ -761,6 +761,115 @@ def api_perms_check(ctx):
 
 
 # ============================================================================
+# API: 静态数据加密（目录策略 / 密钥环 / 轮换 / 落盘验证）
+# ============================================================================
+
+@route("GET", "/api/encryption/status")
+def api_encryption_status(ctx):
+    """加密总览（所有登录用户可读，用于目录锁标记；不含任何密钥明文）。"""
+    return ctx.nn.encryption_overview()
+
+
+@route("GET", "/api/encryption/policies")
+def api_encryption_policies(ctx):
+    """当前启用加密的目录列表（文件浏览页展示锁标记用）。"""
+    return {"policies": ctx.nn.crypto.list_policies(),
+            "active_key_id": ctx.nn.crypto.active_key_id()}
+
+
+@route("POST", "/api/encryption/policy", cap="admin")
+def api_encryption_policy(ctx):
+    body = ctx.json()
+    path = body.get("path", "")
+    enabled = bool(body.get("enabled", True))
+    # 目录必须真实存在
+    ctx.nn.fs.resolve(path)
+    rec = ctx.nn.crypto.set_policy(path, enabled, ctx.actor(),
+                                   body.get("note", ""))
+    ctx.nn.log_event(
+        "WARN" if enabled else "INFO", "encryption",
+        "policy_enable" if enabled else "policy_disable",
+        path, ctx.actor(), f"目录静态加密 {'启用' if enabled else '停用'}")
+    return {"ok": True, "policy": rec}
+
+
+@route("DELETE", "/api/encryption/policy", cap="admin")
+def api_encryption_policy_delete(ctx):
+    path = ctx.query.get("path", "")
+    ctx.nn.crypto.remove_policy(path, ctx.actor())
+    ctx.nn.log_event("WARN", "encryption", "policy_remove", path,
+                     ctx.actor(), "移除目录加密策略")
+    return {"ok": True}
+
+
+@route("GET", "/api/encryption/keys", cap="admin")
+def api_encryption_keys(ctx):
+    """密钥环：仅指纹/掩码/状态/保护块数等摘要，绝不含 wrapped 或明文。"""
+    return ctx.nn.crypto.list_keys_view()
+
+
+@route("POST", "/api/encryption/keys/rotate", cap="admin")
+def api_encryption_rotate(ctx):
+    """
+    轮换 active DEK：旧密钥退役保留（旧文件持续可读），新文件用新密钥。
+    原子元数据翻转 + 旧 DEK 不删除 ⇒ 不存在读不出的窗口。
+    """
+    body = ctx.json() or {}
+    new_rec, old_id = ctx.nn.crypto.rotate_key(ctx.actor(),
+                                               body.get("note", ""))
+    ctx.nn.log_event("WARN", "encryption", "key_rotate", new_rec["id"],
+                     ctx.actor(),
+                     f"新 active DEK {new_rec['id']}（指纹 "
+                     f"{new_rec['fingerprint']}）；旧密钥 {old_id} 退役保留，"
+                     f"历史文件仍按其块表 key_id 解密")
+    ctx.nn.emit("key_rotated",
+                f"数据加密密钥已轮换：{short_hash(old_id or '', 8)} → "
+                f"{short_hash(new_rec['id'], 8)}（旧文件继续可读）")
+    return {"ok": True, "active_id": new_rec["id"], "retired": old_id,
+            "key": ctx.nn.crypto.key_public_view(
+                ctx.nn.crypto._get_record(new_rec["id"]))}
+
+
+@route("POST", "/api/encryption/keys/<key_id>/reveal", cap="admin")
+def api_encryption_reveal(ctx):
+    """
+    查看完整 DEK 明文：必须是 admin 且重新输入本人口令二次认证；
+    每次查看都写审计日志。完整明文仅此一次性响应返回，不进入列表接口。
+    """
+    key_id = ctx.params["key_id"]
+    body = ctx.json() or {}
+    password = body.get("password", "")
+    if not ctx.nn.auth.verify_password(ctx.actor(), password):
+        ctx.nn.log_event("WARN", "encryption", "key_reveal_denied",
+                         key_id, ctx.actor(), "二次口令校验失败，拒绝展示明文")
+        raise ApiError(403, "二次口令校验失败，拒绝展示完整密钥")
+    view = ctx.nn.crypto.reveal_key(key_id)
+    ctx.nn.log_event("WARN", "encryption", "key_reveal", key_id,
+                     ctx.actor(),
+                     f"admin 二次认证后查看完整 DEK 明文（指纹 "
+                     f"{view['fingerprint']}）")
+    # 响应里只带这一次的明文，不附带其它密钥
+    return view
+
+
+@route("POST", "/api/encryption/verify", cap="admin")
+def api_encryption_verify(ctx):
+    """
+    落盘验证：直接读取 DataNode 上的原始字节（绕过 NN 解密），
+    证明加密文件落盘后不是明文，且透明解密可读。
+    """
+    body = ctx.json() or {}
+    path = body.get("path", "")
+    ctx.require_perm(path, "read")
+    result = ctx.nn.verify_path_encryption(path)
+    ctx.nn.log_event("INFO", "encryption", "verify_on_disk", path,
+                     ctx.actor(),
+                     f"落盘验证：密文={result['ciphertext_on_disk']} "
+                     f"透明解密={result['transparent_decrypt_ok']}")
+    return result
+
+
+# ============================================================================
 # API: 日志
 # ============================================================================
 

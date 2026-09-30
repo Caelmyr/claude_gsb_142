@@ -93,6 +93,7 @@ function buildTreeNode(node, path) {
     <span class="tw">${isDir ? (isOpen ? "▾" : "▸") : ""}</span>
     <span>${isDir ? (isOpen ? "🗂" : "🗀") : fileIcon(node)}</span>
     <span class="tn">${esc(node.name)}</span>
+    ${node.encrypted ? '<span class="lock-badge" title="该目录/文件已启用静态加密">🔒</span>' : ""}
     <span class="ts">${isDir ? (node.file_count ?? "") : fmtBytes(node.size)}</span>`;
   row.onclick = (e) => {
     e.stopPropagation();
@@ -124,7 +125,31 @@ async function loadList() {
   const data = await api("GET", "/api/fs/list?path=" + encodeURIComponent(currentPath));
   renderBreadcrumb(data);
   renderGrid(data.items);
+  renderEncHint(data);
   return data;
+}
+
+async function renderEncHint(data) {
+  // 目录自身或其任一祖先启用了加密时，在工具栏给出提示
+  try {
+    const st = data.entry;
+    const el = document.getElementById("enc-hint");
+    if (el) el.remove();
+    const policies = (await api("GET", "/api/encryption/policies")).policies || [];
+    const hit = policies.filter(p => p.enabled &&
+      (currentPath === p.path || currentPath.startsWith(p.path.replace(/\/$/, "") + "/")))
+      .sort((a, b) => b.path.length - a.path.length)[0];
+    if (hit) {
+      const bar = document.querySelector(".toolbar .spacer");
+      const tag = document.createElement("span");
+      tag.id = "enc-hint";
+      tag.className = "badge warn plain";
+      tag.style.marginRight = "8px";
+      tag.title = `该目录位于加密策略 ${hit.path} 下，新文件落盘即为 AES-256-CTR 密文`;
+      tag.textContent = `🔒 ${hit.path} 已加密`;
+      bar.parentNode.insertBefore(tag, bar.nextSibling);
+    }
+  } catch (e) { /* 非关键 */ }
 }
 
 function renderBreadcrumb(data) {
@@ -151,6 +176,7 @@ function renderGrid(items) {
   grid.innerHTML = items.map((it, i) => `
     <div class="fcard ${selected && selected.path === it.path ? "sel" : ""}" data-i="${i}">
       ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="副本健康: ${it.health || "ok"}"></span>` : ""}
+      ${it.encrypted ? '<span class="enc-flag" title="已启用静态加密（落盘为密文）">🔒</span>' : ""}
       <div class="thumb">
         ${it.thumb ? `<img loading="lazy" src="${esc(thumbUrl(it.path))}" alt="" onerror="this.parentElement.textContent='🖼'">` : fileIcon(it)}
       </div>
@@ -202,6 +228,9 @@ async function selectEntry(it) {
             <span class="k">属主 / 模式</span><span class="v">${esc(s.owner)} · ${esc(s.mode)}</span>
             <span class="k">创建 / 修改</span><span class="v">${fmtTs(s.created_at)} · ${fmtTs(s.modified_at)}</span>
             <span class="k">覆盖版本</span><span class="v">v${s.file_version}</span>
+            <span class="k">静态加密</span><span class="v">${s.encrypted
+              ? `🔒 已加密（密钥 ${esc((s.key_id || "").slice(-8))}）`
+              : "未加密（明文落盘）"}</span>
             <span class="k">访问</span><span class="v">${s.access_count} 次 · 最近 ${fmtAgo(s.last_access)}</span>
           </div>
           <div class="btn-group" style="margin-top:14px">

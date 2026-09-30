@@ -262,6 +262,9 @@ async function startUpload(existingSession) {
     lsSet(all);
 
     renderPieces(upState.total, upState.received);
+    setUpStatus(begin.encrypted
+      ? `🔒 目标目录已启用静态加密：分片在服务端加密暂存，块以密文落盘`
+      : `开始上传（目标目录未启用加密，明文落盘）`);
     const t0 = performance.now();
     let retries = 0;
 
@@ -327,6 +330,9 @@ function finishUpload(msg, ok, result) {
       <div class="trace-box">
         <div class="step">✅ 上传完成：<b>${esc(f.path)}</b></div>
         <div class="step">分片 ${result.pieces} 个 → 系统块 ${result.blocks} 个（64KiB 定长分块）· 去重命中 ${result.dedup_hits}</div>
+        <div class="step">${f.encrypted
+          ? '🔒 <b>静态加密</b>：落盘块为 AES-256-CTR 密文（读取时透明解密）'
+          : '未加密：目标目录未启用加密策略（明文落盘）'}</div>
         <div class="step">耗时 ${result.elapsed_s}s · 端到端吞吐 ${result.throughput_mbps} MB/s</div>
         <div class="step">内容哈希 <span class="mono">${esc(f.content_hash.slice(0, 32))}…</span></div>
         <div class="step"><a href="files.html?path=${encodeURIComponent(f.path.split("/").slice(0, -1).join("/") || "/")}">在文件浏览中查看 →</a></div>

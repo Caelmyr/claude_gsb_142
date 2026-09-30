@@ -143,6 +143,17 @@ class AuthManager:
         with self.meta.lock:
             return self.public_user(self.meta.get("users")["users"].get(username))
 
+    def verify_password(self, username, password):
+        """
+        二次校验口令（敏感操作如查看完整 DEK 明文时要求重新认证）。
+        通过返回 True；用户不存在/停用/口令错均返回 False，不区分细节。
+        """
+        with self.meta.lock:
+            user = self.meta.get("users")["users"].get((username or "").strip().lower())
+            if not user or user.get("status") != "active":
+                return False
+            return _hash_password(password or "", user["salt"]) == user["pw_hash"]
+
     def public_user(self, user):
         """脱敏后的用户信息（去除盐与散列）。"""
         if not user:

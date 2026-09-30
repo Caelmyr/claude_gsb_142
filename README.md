@@ -10,7 +10,7 @@
 纯 Python（标准库，零第三方依赖）+ 原生 HTML/CSS/JS 实现的**教学级分布式文件系统**：
 模拟 HDFS 风格的 NameNode / DataNode 集群（节点间全 HTTP 通信），
 在其上叠加 Git 风格的版本控制（提交 / 分支 / 三方合并 / 检出），
-并提供 11 个页面的管理控制台。
+并提供 12 个页面的管理控制台。
 
 代码规模：**约 12,000 行**（后端 ~8,700 行 Python，前端 ~4,400 行 HTML/CSS/JS）。
 
@@ -43,7 +43,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 ---
 
-## 2. 前端页面（11 个，要求 10 个 + 仪表盘）
+## 2. 前端页面（12 个，要求 10 个 + 仪表盘）
 
 | 页面 | 文件 | 内容 |
 |---|---|---|
@@ -56,6 +56,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
 | 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销 |
 | 权限设置 | `permissions.html` | 路径前缀 ACL 规则编辑器、默认策略、**判定轨迹测试器** |
+| 加密管理 | `encryption.html` | 目录静态加密标记、密钥环（摘要/轮换）、二次认证查看明文、**落盘非明文验证** |
 | 系统日志 | `logs.html` | 级别/来源/用户/关键字过滤、分页、展开详情、自动刷新、CSV 导出、清空 |
 | 回收站 | `recycle.html` | 保留期倒计时、恢复 / 彻底删除 / 清空 |
 
@@ -67,7 +68,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 ## 3. 架构
 
 ```
-┌──────────────────────────── 浏览器（11 页面）────────────────────────────┐
+┌──────────────────────────── 浏览器（12 页面）────────────────────────────┐
 │  fetch /api/*（JSON）· /api/download（Range）· /api/thumbnail           │
 └───────────────────────────────────┬──────────────────────────────────────┘
                                     │ HTTP（Bearer 令牌 + 路径 ACL）
@@ -93,9 +94,10 @@ python3 -m backend.datanode --id dn5 --port 8025
 元数据目录布局（`data/`，全部 JSON，崩溃安全）：
 
 ```
-data/meta/{fs,blocks,versions,users,perms,logs,recycle,stats,cluster}.json
-data/sessions/<upload_id>/piece_000000      # 上传分片暂存
-data/datanodes/<node_id>/blocks/<blk>.dat   # 块本体
+data/meta/{fs,blocks,versions,users,perms,logs,recycle,stats,cluster,encryption}.json
+data/keys/master.key(+meta.json)   # NameNode 本地主密钥 KEK（0600，不入库/不下发）
+data/sessions/<upload_id>/piece_000000      # 上传分片暂存（敏感目录下先加密）
+data/datanodes/<node_id>/blocks/<blk>.dat   # 块本体（加密目录=AES-256-CTR 密文）
 data/datanodes/<node_id>/node_state.json    # DN 索引（原子写）
 data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 ```
@@ -159,6 +161,29 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 * **锁序纪律**：全局固定 meta → node → health → cmd，
   心跳注册/复活等路径在锁外执行副作用，避免 ABBA 死锁。
 
+### 4.6 敏感文件静态加密（透明加解密 + 密钥轮换）
+* **加密原语**：纯标准库 AES-256-CTR（`crypto_aes.py`，FIPS-197 +
+  SP800-38A NIST 向量自测通过）；每块随机 96bit nonce，CTR 长度保持且
+  支持按字节偏移 seek（Range 读透明解密）。
+* **落盘前加密 / 读取透明解密**：加密在 **NameNode 侧**完成——DataNode
+  收到、流水线复制、磁盘存储、再复制的一律是密文，DN 不持有任何密钥；
+  上传分片在 `data/sessions/` 暂存时同样先加密。读取时 NN 按块表记录的
+  `key_id` 取 DEK 解密，并用明文 SHA-256 验真（DN 侧 on-disk checksum
+  为密文哈希，副本对账/巡检/损坏演练/恢复复制照常）。
+* **目录策略**（`encryption.html` / `meta['encryption']` 文档）：
+  按最长路径前缀匹配标记哪些目录已启用加密；文件浏览页树/卡片/面包屑
+  显示 🔒，详情与块抽屉展示密钥 id。
+* **信封式密钥环**：主密钥 KEK 仅存于 NameNode 本机
+  `data/keys/master.key`（0600，永不下发/不进 API）；DEK 经
+  AES-CTR + HMAC 包装后存入元数据。列表只给指纹/首掩码/保护块数，
+  **完整明文需 admin 二次输入口令**（`/keys/<id>/reveal`）并写审计日志。
+* **轮换无读不出窗口、历史版本永不失效**：轮换生成新 DEK 置为 active，
+  旧 DEK 仅退役、永不删除；旧块（含全部提交快照/分支/回收站）按其块表
+  key_id 继续用旧密钥解密，新文件用新密钥。轮换是一次原子元数据翻转。
+* **落盘验证**：`POST /api/encryption/verify` 绕过 NN 解密直接取 DN 原始
+  字节，逐块给出可读字符占比、落盘哈希比对与解密校验，直观证明
+  「落盘后确实不是明文」。
+
 ---
 
 ## 5. REST API 摘要（节选）
@@ -178,6 +203,10 @@ GET  /api/stats/overview|hotness|timeline
 GET|POST /api/users  PUT|DELETE /api/users/<name>      （user_admin）
 GET|POST /api/perms  PUT|DELETE /api/perms/<id>        （perm_admin）
 POST /api/perms/check
+GET  /api/encryption/status|policies|keys              （keys 需 admin）
+POST /api/encryption/policy        DELETE /api/encryption/policy   （admin）
+POST /api/encryption/keys/rotate|keys/<id>/reveal      （admin，reveal 需二次口令）
+POST /api/encryption/verify                            （admin，落盘非明文验证）
 GET  /api/logs|logs/export       POST /api/logs/clear  （admin）
 GET  /api/recycle                POST /api/recycle/restore|purge|empty
 POST /internal/heartbeat|block_report      GET /internal/meta/<doc>   （集群密钥）
@@ -196,6 +225,8 @@ gsb4/
 │   ├── chunking.py            # 固定 + CDC 分块、清单、重组校验
 │   ├── diff_engine.py         # Myers / Patience / merge3 / 渲染器
 │   ├── metadata.py            # JSON 文档仓库（原子写 + vv 同步语义）
+│   ├── crypto_aes.py          # 纯标准库 AES-256-CTR（NIST 向量自测）
+│   ├── encryption.py          # 静态加密：KEK/DEK 密钥环、目录策略、轮换、加解密
 │   ├── auth.py                # 用户/口令/会话 + 路径 ACL
 │   ├── filesystem.py          # inode 树 + 回收站
 │   ├── versioning.py          # 提交/分支/合并/检出/GC 引用集
@@ -204,7 +235,7 @@ gsb4/
 │   ├── http_server.py         # 路由 + 静态页 + 鉴权中间件
 │   ├── seed.py                # 演示数据（含冲突合并场景）
 │   └── main.py                # 集群装配
-├── frontend/                  # 11 页面 + css/app.css + js/app.js
+├── frontend/                  # 12 页面 + css/app.css + js/app.js
 └── tests/smoke_test.py        # 97 项端到端断言
 ```
 

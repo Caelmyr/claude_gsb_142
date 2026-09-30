@@ -102,6 +102,7 @@ META_DOCS = [
     "recycle",     # 回收站条目
     "stats",       # 访问热度 / 容量历史 / 小时级吞吐
     "cluster",     # 集群注册表（NameNode 维护，向 DataNode 同步的文档）
+    "encryption",  # 静态加密：密钥环（KEK 包装的 DEK）+ 目录加密策略
 ]
 
 VERSION_VECTOR_SYNC_DOCS = ["cluster"]  # 需要基于版本向量向 DataNode 同步的文档
@@ -180,7 +181,8 @@ LOG_MAX_ENTRIES = 5000                  # logs.json 中最多保留的条数
 LOG_LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
 LOG_LEVEL_SEP = "|"                     # 日志级别多选过滤的分隔符
 LOG_SOURCES = ["namenode", "datanode", "api", "auth", "fs", "block", "version",
-               "recovery", "gc", "sync", "upload", "download", "sim"]
+               "recovery", "gc", "sync", "upload", "download", "sim",
+               "encryption"]
 
 # ----------------------------------------------------------------------------
 # 演示 / 模拟

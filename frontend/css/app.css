@@ -525,3 +525,10 @@ svg.chart .grid-line { stroke: var(--border-soft); stroke-width: 1; }
 .countdown { font-family: var(--mono); font-size: 12px; }
 .countdown.soon { color: var(--warn); }
 .countdown.now { color: var(--bad); }
+
+/* ---------------------------------------------------------------- 加密标记 */
+.fcard .enc-flag {
+  position: absolute; top: 8px; left: 8px;
+  font-size: 12px; filter: drop-shadow(0 0 3px rgba(0,0,0,.6));
+}
+.tree .t-node .lock-badge { font-size: 10px; flex: 0 0 auto; }

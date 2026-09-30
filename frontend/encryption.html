@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>加密管理 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .key-alg { font-family:var(--mono); font-size:12px; color:var(--accent); }
+  .kv.mono .v { font-family:var(--mono); font-size:12.5px; word-break:break-all; }
+  .raw-box {
+    font-family:var(--mono); font-size:11.5px; line-height:1.55;
+    background:#0c111d; border:1px solid var(--line); border-radius:8px;
+    padding:10px 12px; white-space:pre-wrap; word-break:break-all;
+    max-height:160px; overflow:auto;
+  }
+  .raw-box.cipher { color:#f0a538; }
+  .raw-box.plain { color:#2fbf71; }
+  .lock-on { color:#f0a538; }
+  .reveal-box {
+    font-family:var(--mono); font-size:13px; background:#0c111d;
+    border:1px solid #b8860b; border-radius:8px; padding:10px 12px;
+    word-break:break-all; user-select:all;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">加密管理</h1>
+        <div class="sub" id="page-sub">静态数据加密（AES-256-CTR）· 目录策略 · 密钥环与轮换 · 落盘验证</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn sm primary" id="btn-add-policy">＋ 为目录启用加密</button>
+      <button class="btn sm" id="btn-rotate">⟳ 轮换密钥</button>
+      <button class="btn sm ghost" id="btn-refresh">⟳</button>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <!-- KPI -->
+      <div class="grid cols-5" id="kpis" style="margin-bottom:16px"></div>
+
+      <div class="grid cols-2">
+        <!-- 目录策略 -->
+        <div class="card">
+          <div class="card-title">已启用加密的目录
+            <span class="hint">落盘前透明加密，读取时透明解密；策略按最长路径前缀匹配</span>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>目录</th><th>状态</th><th class="right">文件</th><th class="right">大小</th><th>密钥</th><th>操作</th></tr></thead>
+            <tbody id="policy-body"></tbody>
+          </table></div>
+        </div>
+
+        <!-- 密钥环 -->
+        <div class="card">
+          <div class="card-title">密钥环
+            <span class="hint">列表仅展示指纹/掩码；完整明文需二次认证</span>
+          </div>
+          <div class="small muted" style="margin:4px 0 10px">
+            主密钥（KEK）仅存于 NameNode 本机 <span class="mono">data/keys/master.key</span>（0600），
+            永不下发；数据密钥（DEK）以 KEK 包装后存入元数据。
+            KEK 指纹：<b class="mono" id="kek-fp">…</b>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>状态</th><th>密钥</th><th class="right">保护块</th><th>创建</th><th></th></tr></thead>
+            <tbody id="key-body"></tbody>
+          </table></div>
+          <div class="small muted" style="margin-top:8px" id="rotate-note">
+            轮换后：旧密钥<b>退役但保留</b>，旧文件/历史版本仍按块上记录的密钥可读；
+            新文件使用新密钥。轮换是原子操作，不存在读不出的窗口。
+          </div>
+        </div>
+      </div>
+
+      <!-- 落盘验证 -->
+      <div class="card">
+        <div class="card-title">落盘明文验证
+          <span class="hint">直接读取 DataNode 上的原始字节（绕过 NameNode 解密），证明确实不是明文</span>
+        </div>
+        <div class="form-row" style="margin-bottom:12px">
+          <label class="fl" style="flex:2">文件路径
+            <input type="text" id="vf-path" placeholder="/finance/payroll-q3.csv" list="vf-list"></label>
+          <datalist id="vf-list"></datalist>
+          <button class="btn primary" id="vf-run">验证落盘内容</button>
+        </div>
+        <div id="vf-summary" class="small muted">输入一个已加密文件路径，逐块校验其在磁盘上的字节为密文，且透明解密后与明文校验和一致。</div>
+        <div id="vf-out" style="margin-top:12px"></div>
+      </div>
+
+      <!-- 说明 -->
+      <div class="card">
+        <div class="card-title">工作方式</div>
+        <div class="grid cols-3" style="gap:14px">
+          <div>
+            <div class="badge acc plain" style="margin-bottom:6px">写入</div>
+            <div class="small dim">文件分块后，每块用当前 active DEK + 随机 nonce 做
+              AES-256-CTR；发送给 DataNode、流水线复制、落盘的都是密文。
+              上传分片在暂存区同样先加密。</div>
+          </div>
+          <div>
+            <div class="badge ok plain" style="margin-bottom:6px">读取</div>
+            <div class="small dim">NameNode 从 DataNode 取回密文，按块表记录的
+              key_id（可能是退役旧密钥）透明解密，并用明文 SHA-256 验真；
+              支持 Range 分段读取（CTR 随机 seek）。</div>
+          </div>
+          <div>
+            <div class="badge violet plain" style="margin-bottom:6px">轮换</div>
+            <div class="small dim">生成新 DEK 置为 active，旧 DEK 退役保留。
+              旧块不重写、不失效；历史提交/快照/回收站中的文件永远可读。
+              DN 磁盘对账使用密文哈希，副本恢复/巡检照常工作。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg } = DFSVS;
+
+let overview = null;
+
+// ------------------------------------------------------------------ 加载
+async function load() {
+  try {
+    overview = await api("GET", "/api/encryption/status");
+    renderKpis(overview);
+    renderPolicies(overview.policies);
+    renderKeys(overview.keyring);
+    renderSuggest(overview);
+  } catch (e) {
+    toast("加载加密状态失败：" + e.message, "bad");
+  }
+}
+
+function renderKpis(ov) {
+  const s = ov.stats;
+  const active = ov.keyring.keys.find(k => k.id === ov.keyring.active_id);
+  document.getElementById("kpis").innerHTML = `
+    <div class="kpi"><div class="k-label">加密目录</div>
+      <div class="k-value">${ov.policies.filter(p => p.enabled).length}</div></div>
+    <div class="kpi"><div class="k-label">加密文件</div>
+      <div class="k-value">${s.encrypted_files}</div></div>
+    <div class="kpi"><div class="k-label">加密块</div>
+      <div class="k-value">${s.encrypted_blocks}</div></div>
+    <div class="kpi"><div class="k-label">加密逻辑数据</div>
+      <div class="k-value" style="font-size:20px">${fmtBytes(s.encrypted_logical_bytes)}</div></div>
+    <div class="kpi accent"><div class="k-label">算法 / 密钥代数</div>
+      <div class="k-value" style="font-size:16px">${esc(ov.alg.replace("AES-", "AES "))} · ${ov.keyring.keys.length} 代</div></div>`;
+}
+
+function renderSuggest(ov) {
+  const paths = ov.stats.encrypted_paths_sample || [];
+  document.getElementById("vf-list").innerHTML =
+    paths.map(p => `<option value="${esc(p)}">`).join("");
+}
+
+// ------------------------------------------------------------------ 目录策略
+function renderPolicies(policies) {
+  const body = document.getElementById("policy-body");
+  if (!policies.length) {
+    body.innerHTML = `<tr><td colspan="6" class="empty small">
+      尚未为任何目录启用加密。点击右上角「为目录启用加密」，例如 <span class="mono">/finance</span>。</td></tr>`;
+    return;
+  }
+  body.innerHTML = policies.map(p => `
+    <tr>
+      <td class="mono lock-on">🔒 ${esc(p.path)}</td>
+      <td>${p.enabled
+        ? '<span class="badge ok plain">已启用</span>'
+        : '<span class="badge dim plain">已停用</span>'}
+        ${p.dir_exists ? "" : '<span class="badge warn plain" title="目录当前不存在">目录缺失</span>'}</td>
+      <td class="num right">${p.files}</td>
+      <td class="num right">${fmtBytes(p.bytes)}</td>
+      <td class="mono small">${p.key_id ? esc(p.key_id.slice(-8)) : "-"}</td>
+      <td class="nowrap">
+        <button class="btn xs pv-verify" data-path="${esc(p.path)}">验证</button>
+        <button class="btn xs danger pv-off" data-path="${esc(p.path)}">停用</button>
+      </td>
+    </tr>`).join("");
+  body.querySelectorAll(".pv-verify").forEach(b =>
+    b.onclick = () => { document.getElementById("vf-path").value = b.dataset.path; runVerify(); });
+  body.querySelectorAll(".pv-off").forEach(b =>
+    b.onclick = () => disablePolicy(b.dataset.path));
+}
+
+async function enablePolicy() {
+  promptDlg("为目录启用静态加密", [
+    { name: "path", label: "目录路径（需已存在）", placeholder: "/finance" },
+    { name: "note", label: "备注（可选）", placeholder: "例如：财务薪酬数据" },
+  ], async (v) => {
+    const path = (v.path || "").trim();
+    if (!path.startsWith("/")) { toast("请输入绝对路径，如 /finance", "warn"); return false; }
+    try {
+      await api("POST", "/api/encryption/policy", { path, enabled: true, note: v.note || "" });
+      toast(`已对 ${path} 启用加密（新写入文件落盘即为密文）`, "ok");
+      load();
+    } catch (e) { toast(e.message, "bad"); return false; }
+  });
+}
+
+async function disablePolicy(path) {
+  confirmDlg(
+    `停用 ${path} 的加密？该目录下「已有文件仍保持加密、可正常读取」，仅之后的新写入按明文落盘。`,
+    async () => {
+      try {
+        await api("DELETE", "/api/encryption/policy?path=" + encodeURIComponent(path));
+        toast("已停用加密策略（历史文件不受影响）", "ok");
+        load();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+}
+
+// ------------------------------------------------------------------ 密钥环
+function renderKeys(kr) {
+  document.getElementById("kek-fp").textContent = (kr.kek_fingerprint || "").slice(0, 16);
+  const body = document.getElementById("key-body");
+  body.innerHTML = kr.keys.map(k => `
+    <tr>
+      <td>${k.state === "active"
+        ? '<span class="badge ok plain">● 当前</span>'
+        : '<span class="badge dim plain">已退役</span>'}</td>
+      <td>
+        <div class="mono" style="font-size:12.5px">${esc(k.brief)}</div>
+        <div class="small muted">指纹 <span class="mono">${esc(k.fingerprint)}</span>
+          · ${esc(k.alg || "")} v${k.version || 1}</div>
+      </td>
+      <td class="num right">${k.protected_blocks}</td>
+      <td class="small dim">${fmtAgo(k.created_at)}</td>
+      <td class="nowrap"><button class="btn xs kv-reveal" data-id="${esc(k.id)}">查看明文</button></td>
+    </tr>`).join("");
+  body.querySelectorAll(".kv-reveal").forEach(b =>
+    b.onclick = () => revealKey(b.dataset.id));
+}
+
+function revealKey(id) {
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <div class="small" style="margin-bottom:8px">
+      完整数据密钥（DEK）为敏感凭据。需要<b>重新输入您的登录口令</b>二次认证，
+      且本次查看会写入审计日志。请勿在共享屏幕上展示。</div>
+    <label class="fl" style="margin-bottom:10px">当前账号登录口令
+      <input type="password" id="rk-pass" autocomplete="off" placeholder="重新输入口令"></label>
+    <div id="rk-out"></div>`;
+  const m = modal({
+    title: "查看完整密钥（二次认证）", body, okText: "显示明文",
+    onOk: async (bodyEl) => {
+      const password = bodyEl.querySelector("#rk-pass").value;
+      const out = bodyEl.querySelector("#rk-out");
+      try {
+        const r = await api("POST",
+          "/api/encryption/keys/" + encodeURIComponent(id) + "/reveal",
+          { password });
+        out.innerHTML = `
+          <div class="small muted" style="margin:6px 0 4px">
+            ${esc(r.state === "active" ? "● 当前 active 密钥" : "已退役密钥（历史文件仍在使用）")}
+            · 指纹 <span class="mono">${esc(r.fingerprint)}</span></div>
+          <div class="reveal-box" id="rk-material">${esc(r.material_hex)}</div>
+          <div class="small muted" style="margin-top:6px">
+            base64：<span class="mono">${esc(r.material_b64)}</span></div>`;
+        toast("已记录本次密钥查看行为到审计日志", "warn");
+        return false;   // 保持弹窗，允许复制后手动关闭
+      } catch (e) {
+        out.innerHTML = `<span class="badge bad plain">${esc(e.message)}</span>`;
+        return false;
+      }
+    }
+  });
+  setTimeout(() => body.querySelector("#rk-pass").focus(), 50);
+}
+
+// ------------------------------------------------------------------ 轮换
+function rotate() {
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <div class="small" style="line-height:1.7">
+      将生成一把新的 AES-256 数据密钥并设为当前密钥：
+      <ul style="margin:8px 0 0 18px">
+        <li>新上传/新写入的文件使用<b>新密钥</b>；</li>
+        <li>所有旧文件、历史版本、回收站文件继续用<b>旧密钥</b>透明解密，<b>不受影响</b>；</li>
+        <li>旧密钥仅标记为「已退役」并永久保留，轮换期间<b>没有不可读窗口</b>。</li>
+      </ul>
+    </div>
+    <label class="fl" style="margin-top:10px">备注（可选）
+      <input type="text" id="rot-note" placeholder="例如：季度轮换 / 合规要求"></label>`;
+  modal({
+    title: "轮换数据加密密钥", body, okText: "确认轮换",
+    onOk: async (bodyEl) => {
+      try {
+        await api("POST", "/api/encryption/keys/rotate",
+                  { note: bodyEl.querySelector("#rot-note").value });
+        toast("密钥已轮换；旧文件继续可读，新文件使用新密钥", "ok");
+        load();
+      } catch (e) { toast(e.message, "bad"); return false; }
+    }
+  });
+}
+
+// ------------------------------------------------------------------ 落盘验证
+async function runVerify() {
+  const path = document.getElementById("vf-path").value.trim();
+  const out = document.getElementById("vf-out");
+  const sum = document.getElementById("vf-summary");
+  if (!path) { toast("请输入文件路径", "warn"); return; }
+  out.innerHTML = `<span class="muted small">正在从 DataNode 直接取原始落盘字节 …</span>`;
+  try {
+    const r = await api("POST", "/api/encryption/verify", { path });
+    if (!r.encrypted) {
+      sum.innerHTML = `<span class="badge warn plain">该文件未启用加密</span>
+        <span class="small muted" style="margin-left:8px">其块以明文存储（符合当前策略）。</span>`;
+    } else {
+      sum.innerHTML = `
+        <span class="badge ${r.ciphertext_on_disk ? "ok" : "bad"} plain">
+          ${r.ciphertext_on_disk ? "✓ 落盘内容为密文（不可直接读懂）" : "✗ 落盘疑似明文"}</span>
+        <span class="badge ${r.transparent_decrypt_ok ? "ok" : "bad"} plain" style="margin-left:6px">
+          ${r.transparent_decrypt_ok ? "✓ 透明解密校验通过" : "✗ 解密校验失败"}</span>
+        <span class="small muted" style="margin-left:8px">明文 SHA-256：
+          <span class="mono">${esc((r.plaintext_content_hash || "").slice(0, 32))}…</span></span>`;
+    }
+    out.innerHTML = `<div class="table-wrap"><table class="tbl">
+      <thead><tr><th>块</th><th>节点</th><th>加密</th><th class="right">大小</th>
+        <th class="right">可读字符占比</th><th>落盘判定</th><th>解密</th><th>落盘字节预览</th></tr></thead>
+      <tbody>${r.blocks.map(b => b.missing ? `
+        <tr><td class="mono">${esc((b.block||"").slice(-8))}</td>
+          <td colspan="7"><span class="badge bad">块丢失</span></td></tr>` : `
+        <tr>
+          <td class="mono">${esc(b.short)}</td>
+          <td>${esc(b.node)}</td>
+          <td>${b.encrypted ? "🔒" : "—"}</td>
+          <td class="num right">${fmtBytes(b.size)}</td>
+          <td class="num right">${(b.text_ratio * 100).toFixed(1)}%</td>
+          <td>${b.encrypted
+              ? (b.ciphertext_on_disk
+                ? '<span class="badge ok plain">密文</span>'
+                : '<span class="badge bad plain">疑似明文</span>')
+              : '<span class="badge dim plain">明文块</span>'}</td>
+          <td>${Object.prototype.hasOwnProperty.call(b, "decrypt_ok")
+              ? (b.decrypt_ok ? '<span class="badge ok plain">通过</span>'
+                              : '<span class="badge bad plain">失败</span>')
+              : "—"}</td>
+          <td class="mono small" style="max-width:220px;overflow:hidden;text-overflow:ellipsis"
+              title="${esc(b.preview_raw || "")}">${esc(b.preview_raw || "")}</td>
+        </tr>`).join("")}
+      </tbody></table></div>`;
+  } catch (e) {
+    out.innerHTML = "";
+    sum.innerHTML = `<span class="badge bad plain">${esc(e.message)}</span>`;
+  }
+}
+
+document.getElementById("btn-add-policy").onclick = enablePolicy;
+document.getElementById("btn-rotate").onclick = rotate;
+document.getElementById("btn-refresh").onclick = load;
+document.getElementById("vf-run").onclick = runVerify;
+document.getElementById("vf-path").addEventListener("keydown", e => {
+  if (e.key === "Enter") runVerify();
+});
+
+initPage("encryption.html", "加密管理", "静态数据加密 · 密钥环 · 透明加解密").then(load);
+</script>
+</body>
+</html>

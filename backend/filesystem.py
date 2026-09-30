@@ -299,6 +299,8 @@ class VirtualFS:
             "last_access": inode.get("last_access"),
             "blocks": len(inode.get("block_ids", [])),
             "thumb": bool(inode.get("mime", "").startswith("image/")),
+            "encrypted": bool(inode.get("encrypted")),
+            "key_id": inode.get("key_id"),
         }
         if inode["type"] == "dir":
             info["children"] = len(inode.get("children", []))
@@ -337,6 +339,7 @@ class VirtualFS:
                     "mime": node.get("mime", ""),
                     "modified_at": node.get("modified_at"),
                     "blocks": len(node.get("block_ids", [])),
+                    "encrypted": bool(node.get("encrypted")),
                 }
                 if node["type"] == "dir" and depth < max_depth:
                     kids = []

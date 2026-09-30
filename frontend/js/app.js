@@ -212,6 +212,7 @@ const DFSVS = (() => {
       { href: "logs.html", ico: "🗎", name: "系统日志" },
     ]},
     { group: "管理", items: [
+      { href: "encryption.html", ico: "🔒", name: "加密管理" },
       { href: "users.html", ico: "👤", name: "用户管理" },
       { href: "permissions.html", ico: "🔑", name: "权限设置" },
     ]},
