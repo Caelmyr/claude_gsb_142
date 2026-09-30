@@ -102,6 +102,7 @@ META_DOCS = [
     "recycle",     # 回收站条目
     "stats",       # 访问热度 / 容量历史 / 小时级吞吐
     "cluster",     # 集群注册表（NameNode 维护，向 DataNode 同步的文档）
+    "crypto",      # 落盘加密：加密目录 + 密钥版本链（仅 NameNode，绝不同步给 DataNode）
 ]
 
 VERSION_VECTOR_SYNC_DOCS = ["cluster"]  # 需要基于版本向量向 DataNode 同步的文档
@@ -158,8 +159,9 @@ DEFAULT_ADMIN_PASSWORD = "admin123"
 ROLE_CAPABILITIES = {
     "admin": {
         "label": "管理员",
-        "desc": "全部权限：用户/权限管理、故障演练、系统配置",
-        "caps": ["read", "write", "delete", "admin", "user_admin", "perm_admin", "sim"],
+        "desc": "全部权限：用户/权限管理、加密密钥管理、故障演练、系统配置",
+        "caps": ["read", "write", "delete", "admin", "user_admin", "perm_admin",
+                 "crypto_admin", "sim"],
     },
     "operator": {
         "label": "运维员",
@@ -180,7 +182,7 @@ LOG_MAX_ENTRIES = 5000                  # logs.json 中最多保留的条数
 LOG_LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
 LOG_LEVEL_SEP = "|"                     # 日志级别多选过滤的分隔符
 LOG_SOURCES = ["namenode", "datanode", "api", "auth", "fs", "block", "version",
-               "recovery", "gc", "sync", "upload", "download", "sim"]
+               "recovery", "gc", "sync", "upload", "download", "sim", "crypto"]
 
 # ----------------------------------------------------------------------------
 # 演示 / 模拟

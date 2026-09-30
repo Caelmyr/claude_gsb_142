@@ -143,6 +143,15 @@ class AuthManager:
         with self.meta.lock:
             return self.public_user(self.meta.get("users")["users"].get(username))
 
+    def verify_password(self, username, password):
+        """校验用户名+口令是否正确（用于敏感操作前的二次确认，不创建会话）。"""
+        with self.meta.lock:
+            user = self.meta.get("users")["users"].get(
+                (username or "").strip().lower())
+            if not user or user["status"] != "active":
+                return False
+            return _hash_password(password or "", user["salt"]) == user["pw_hash"]
+
     def public_user(self, user):
         """脱敏后的用户信息（去除盐与散列）。"""
         if not user:

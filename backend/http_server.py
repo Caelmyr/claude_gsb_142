@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import config, diff_engine
 from .auth import AuthError
 from .filesystem import FsError
+from .keystore import KeyStoreError
 from .namenode import MissingBlockError, NNError
 from .util import (content_range_value, decode_text, now, parse_range,
                    sha256_bytes, short_hash, to_rate_units)
@@ -170,10 +171,11 @@ def api_sessions(ctx):
 # ============================================================================
 
 def _annotate_health(nn, entries):
-    """给目录列表中的文件补充副本健康度。"""
+    """给目录列表中的文件补充副本健康度与落盘加密标记。"""
     with nn.meta.lock:
         blocks = nn.meta.get("blocks")["blocks"]
         for e in entries:
+            e["encrypted_scope"] = nn.keys.scope_of(e.get("path", ""))
             if e["type"] != "file":
                 continue
             inode = nn.fs.get_inode(e["id"])
@@ -181,12 +183,15 @@ def _annotate_health(nn, entries):
                 continue
             worst = "ok"
             live_min = None
+            enc_kids = set()
             for bid in inode.get("block_ids", []):
                 blk = blocks.get(bid)
                 if not blk:
                     worst = "missing"
                     live_min = 0
                     break
+                if blk.get("encrypted"):
+                    enc_kids.add(blk.get("enc_kid"))
                 live = len(nn.live_good_replicas(blk))
                 live_min = live if live_min is None else min(live_min, live)
                 if live == 0:
@@ -195,13 +200,20 @@ def _annotate_health(nn, entries):
                     worst = "under"
             e["health"] = worst
             e["live_replicas"] = live_min
+            # 该文件是否所有块均为密文（启用加密前已存在的旧文件可能仍是明文块）
+            e["blocks_encrypted"] = bool(enc_kids)
+            e["fully_encrypted"] = (
+                bool(e.get("encrypted_scope"))
+                and len(enc_kids) == len(inode.get("block_ids", []))
+                and len(inode.get("block_ids", [])) > 0)
     return entries
 
 
 @route("GET", "/api/fs/tree")
 def api_fs_tree(ctx):
     return {"tree": ctx.nn.fs.tree_json(),
-            "trash": ctx.nn.fs.trash_stats()}
+            "trash": ctx.nn.fs.trash_stats(),
+            "encrypted_paths": ctx.nn.keys.enabled_paths()}
 
 
 @route("GET", "/api/fs/list")
@@ -220,6 +232,18 @@ def api_fs_stat(ctx):
     ctx.require_perm(path, "read")
     inode = ctx.nn.fs.resolve(path)
     info = ctx.nn.fs.entry_info(inode, path)
+    info["encrypted_scope"] = ctx.nn.keys.scope_of(path)
+    if inode.get("type") == "file":
+        with ctx.nn.meta.lock:
+            kids = {b.get("enc_kid")
+                    for bid in inode.get("block_ids", [])
+                    for b in [ctx.nn.meta.get("blocks")["blocks"].get(bid)]
+                    if b and b.get("encrypted")}
+        info["blocks_encrypted"] = bool(kids)
+        info["fully_encrypted"] = (
+            bool(info["encrypted_scope"])
+            and len(kids) == len(inode.get("block_ids", []))
+            and len(inode.get("block_ids", [])) > 0)
     return {"stat": info}
 
 
@@ -761,6 +785,106 @@ def api_perms_check(ctx):
 
 
 # ============================================================================
+# API: 落盘加密（加密目录 / 密钥版本链 / 轮换 / 落盘验证）
+# ============================================================================
+
+@route("GET", "/api/crypto/overview")
+def api_crypto_overview(ctx):
+    """加密总览：已启用目录、各密钥版本摘要与用量（不含密钥明文）。"""
+    data = ctx.nn.keys.encryption_overview()
+    # 当前用户角色决定前端是否展示管理动作；完整密钥绝不随此接口返回
+    data["can_manage"] = ctx.nn.auth.has_cap(ctx.user, "crypto_admin")
+    data["user"] = ctx.user["username"]
+    return data
+
+
+@route("POST", "/api/crypto/enable", cap="crypto_admin")
+def api_crypto_enable(ctx):
+    body = ctx.json()
+    path = (body.get("path") or "").strip()
+    if not path:
+        raise ApiError(400, "请提供目录路径")
+    ctx.require_perm(path, "admin")
+    view = ctx.nn.keys.enable_scope(path, ctx.actor(), body.get("note", ""))
+    ctx.nn.log_event("WARN", "crypto", "enable_api", path, ctx.actor(), "")
+    return {"ok": True, "scope": view}
+
+
+@route("POST", "/api/crypto/rotate", cap="crypto_admin")
+def api_crypto_rotate(ctx):
+    body = ctx.json()
+    path = (body.get("path") or "").strip()
+    view = ctx.nn.keys.rotate(path, ctx.actor(), body.get("note", ""))
+    return {"ok": True, "scope": view}
+
+
+@route("POST", "/api/crypto/reencrypt", cap="crypto_admin")
+def api_crypto_reencrypt(ctx):
+    body = ctx.json()
+    path = (body.get("path") or "").strip()
+    if not ctx.nn.keys.is_enabled(path):
+        raise ApiError(400, f"目录未启用加密: {path}")
+    ctx.require_perm(path, "write")
+    result = ctx.nn.reencrypt_path(path, ctx.actor())
+    return {"ok": True, **result}
+
+
+@route("GET", "/api/crypto/scope")
+def api_crypto_scope(ctx):
+    """查询某个路径的加密生效情况（任何登录用户可读，用于目录打标）。"""
+    path = ctx.query.get("path", "/")
+    scope_path = ctx.nn.keys.scope_of(path)
+    return {
+        "path": path, "encrypted": bool(scope_path), "scope": scope_path,
+        "enabled_paths": ctx.nn.keys.enabled_paths(),
+    }
+
+
+@route("POST", "/api/crypto/verify")
+def api_crypto_verify(ctx):
+    """
+    落盘验证：直接取 DataNode 原始字节核验「确实不是明文」+ 可正确解密。
+    需要对该路径的 read 权限（管理动作由前端按 can_manage 控制）。
+    """
+    body = ctx.json()
+    path = (body.get("path") or "").strip()
+    ctx.require_perm(path, "read")
+    result = ctx.nn.verify_file_encryption(path)
+    ctx.nn.log_event("INFO", "crypto", "verify_on_disk", path, ctx.actor(),
+                     "encrypted=" + str(result.get("encrypted"))
+                     + " ok=" + str(result.get("all_ok")))
+    return result
+
+
+@route("POST", "/api/crypto/reveal", cap="crypto_admin")
+def api_crypto_reveal(ctx):
+    """
+    查看完整密钥明文：必须再次提交管理员口令二次确认；
+    仅 crypto_admin（admin 角色）可调，每次查看都写审计日志。
+    """
+    body = ctx.json()
+    path = (body.get("path") or "").strip()
+    kid = (body.get("kid") or "").strip()
+    password = body.get("password") or ""
+    reason = (body.get("reason") or "").strip()
+    username = ctx.user["username"]
+    if not ctx.nn.auth.verify_password(username, password):
+        ctx.nn.log_event("WARN", "crypto", "key_reveal_denied", path,
+                         username, "二次口令校验失败")
+        raise ApiError(403, "二次口令校验失败，已拒绝查看密钥明文")
+    if not reason:
+        raise ApiError(400, "请填写查看原因（审计留痕）")
+    secret = ctx.nn.keys.reveal_key(path, kid, username, reason)
+    return {"ok": True, "secret": secret}
+
+
+@route("GET", "/api/crypto/revels", cap="crypto_admin")
+def api_crypto_revels(ctx):
+    """最近的密钥明文查看审计记录（只含元信息，绝不含密钥本身）。"""
+    return {"revels": ctx.nn.keys.recent_revels()}
+
+
+# ============================================================================
 # API: 日志
 # ============================================================================
 
@@ -1032,7 +1156,8 @@ class NameNodeHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, 403)
         except MissingBlockError as e:
             self._send_json({"error": str(e), "degraded": True}, 503)
-        except (FsError, NNError, VersionError, ValueError) as e:
+        except (FsError, NNError, VersionError, KeyStoreError,
+                ValueError) as e:
             self._send_json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             nn.log_event("ERROR", "api", "unhandled", path, "system",

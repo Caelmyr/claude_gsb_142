@@ -1,60 +1,60 @@
 {
  "doc": "users",
  "vv": {
-  "namenode": 20
+  "namenode": 8
  },
- "updated_at": 1790427138.618471,
+ "updated_at": 1790782268.8945649,
  "data": {
   "users": {
    "admin": {
     "username": "admin",
-    "salt": "e8f006e3253774406ef84ee36d9aafac",
-    "pw_hash": "67cede4c7c383652e873ae18ebdc684ea6d5d194f4f2db2b275dfd16bbd31fd2",
+    "salt": "1bf086ee9fea9844a16f36cc43e70bf3",
+    "pw_hash": "5e00ec1f6b9ec3488e8bce1c2b8f1f2293d2c63ec07f59eba4e44130a4a1e3b4",
     "role": "admin",
     "email": "admin@dfsvs.local",
     "note": "系统内置管理员",
     "status": "active",
-    "created_at": 1790384120.003358,
-    "last_login": 1790427138.6184611,
-    "login_count": 15
+    "created_at": 1790781909.5490851,
+    "last_login": 1790782268.894555,
+    "login_count": 3
    },
    "alice": {
     "username": "alice",
-    "salt": "b939d3426242e9f15b07b37449c0ea56",
-    "pw_hash": "26393bfb6ec73840cc3dc39136be00a1456cd80d0358267d84ece5e286e11ef5",
+    "salt": "3d25dedc2d91487302317bee652c7d31",
+    "pw_hash": "7ef4310f311e8359a8117ff93790ea363e6ce7b2c96b2510aa80edf4e3a3761c",
     "role": "operator",
     "email": "alice@dfsvs.local",
     "note": "运维一组",
     "status": "active",
-    "created_at": 1790384122.1715567,
+    "created_at": 1790781911.7191842,
     "last_login": null,
     "login_count": 0
    },
    "bob": {
     "username": "bob",
-    "salt": "3912ac999302d96ddfde2d7b514931da",
-    "pw_hash": "5046d001b4dfbe031c1cb5d6f9e1e430d619a47c2f304a223b1ca883df89d1e8",
+    "salt": "14627f8cbc244790fdded4b4e0614d0a",
+    "pw_hash": "b5e8e02edb016efb4c68cf4907995ebbe9e359f32b1aaed1f8bacc6ff57bf781",
     "role": "viewer",
     "email": "bob@dfsvs.local",
     "note": "只读审计",
     "status": "active",
-    "created_at": 1790384122.2197604,
+    "created_at": 1790781911.766707,
     "last_login": null,
     "login_count": 0
    },
    "carol": {
     "username": "carol",
-    "salt": "efbd5dd6954f961c47d404468d0a6885",
-    "pw_hash": "53ca7f9cb58926123ae46e8eab84f6bae21d6f5f63ab4a12aa4cc444893c8228",
+    "salt": "c4af400a1296dc1e4d7b8f525c1c5b77",
+    "pw_hash": "a82a86fc6d58406df06f8abd0267b90ac587bd9dea8e0f285ced89db780fdfe7",
     "role": "operator",
     "email": "carol@dfsvs.local",
     "note": "设计资源维护",
     "status": "disabled",
-    "created_at": 1790384122.2692902,
+    "created_at": 1790781911.8164408,
     "last_login": null,
     "login_count": 0
    }
   },
-  "created_at": 1790384119.9543657
+  "created_at": 1790781909.5026631
  }
 }

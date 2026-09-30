@@ -1,37 +1,37 @@
 {
  "doc": "cluster",
  "vv": {
-  "namenode": 18
+  "namenode": 4
  },
- "updated_at": 1790427137.2489693,
+ "updated_at": 1790781913.5031908,
  "data": {
   "nodes": {
    "dn1": {
     "rack": "rack-1",
     "state": "LIVE",
     "url": "http://127.0.0.1:8021",
-    "registered_at": 1790427137.2429924
+    "registered_at": 1790781911.066676
    },
    "dn2": {
     "rack": "rack-2",
     "state": "LIVE",
     "url": "http://127.0.0.1:8022",
-    "registered_at": 1790427137.2451222
+    "registered_at": 1790781911.071026
    },
    "dn3": {
     "rack": "rack-3",
     "state": "LIVE",
     "url": "http://127.0.0.1:8023",
-    "registered_at": 1790427137.247454
+    "registered_at": 1790781911.072773
    }
   },
   "updated_by": "namenode",
-  "nn_started_at": 1790427135.7178843,
+  "nn_started_at": 1790781909.5000944,
   "settings": {
    "block_size": 65536,
    "replication": 3,
    "heartbeat_timeout": 6.0
   },
-  "seeded_v1": 1790384123.890133
+  "seeded_v1": 1790781913.503187
  }
 }

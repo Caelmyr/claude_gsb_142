@@ -32,6 +32,7 @@ import threading
 from . import chunking, config
 from .auth import AuthManager, PermissionManager
 from .filesystem import FsError, VirtualFS
+from .keystore import KeyStore, KeyStoreError
 from .metadata import MetadataStore
 from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
                    guess_mime, hour_key, http_json, http_request,
@@ -68,6 +69,7 @@ class NameNode:
         self.fs = VirtualFS(self.meta)
         self.auth = AuthManager(self.meta)
         self.perms = PermissionManager(self.meta, self.auth)
+        self.keys = KeyStore(self)
         self.versions = VersionStore(self)
 
         # ---- 节点注册表（内存态；摘要持久化到 cluster 文档） ----
@@ -105,6 +107,7 @@ class NameNode:
         self.fs.init_root()
         self.auth.ensure_seed()
         self.perms.ensure_seed()
+        self.keys.ensure_seed()
         self.versions.ensure_head()
         self._init_blocks_doc()
         self._init_stats_doc()
@@ -144,7 +147,8 @@ class NameNode:
         with self.meta.lock:
             blocks = self.meta.get("blocks")
             blocks.setdefault("blocks", {})
-            blocks.setdefault("by_checksum", {})     # 内容去重索引
+            blocks.setdefault("by_checksum", {})     # 明文块内容去重索引
+            blocks.setdefault("by_plain_kid", {})    # 加密块按 (kid,明文校验和) 去重
             blocks.setdefault("next_genstamp", 1000)
             self.meta.touch("blocks", flush=False)
 
@@ -671,8 +675,10 @@ class NameNode:
         return pull
 
     def get_meta_doc(self, doc):
-        if doc not in config.META_DOCS:
-            raise NNError(f"未知文档: {doc}")
+        # 仅允许向 DataNode 同步白名单内的文档；crypto 文档含数据密钥，
+        # 即使持有集群密钥也绝不能经内部接口导出。
+        if doc not in config.VERSION_VECTOR_SYNC_DOCS:
+            raise NNError(f"文档不允许同步到 DataNode: {doc}")
         return self.meta.export_doc(doc)
 
     # ==================================================================
@@ -713,8 +719,13 @@ class NameNode:
             raise NNError("没有满足空间要求的存活节点，无法放置副本")
         return self._rank_targets(live, size, min(count, len(live)))
 
-    def allocate_block(self, size, checksum, desired=None, genstamp=None):
-        """在块表登记新块（副本随后通过流水线复制填充）。"""
+    def allocate_block(self, size, checksum, desired=None, genstamp=None,
+                       plain_checksum=None, plain_size=None, enc_kid=None):
+        """
+        在块表登记新块（副本随后通过流水线复制填充）。
+        size/checksum 指**落盘字节**（加密块即密文容器），供 DataNode 对账；
+        加密块额外记录 plain_checksum / plain_size / enc_kid。
+        """
         with self.meta.lock:
             blocks_doc = self.meta.get("blocks")
             blocks = blocks_doc["blocks"]
@@ -723,24 +734,46 @@ class NameNode:
                 bid = gen_id("blk")
             gs = genstamp or blocks_doc.get("next_genstamp", 1000)
             blocks_doc["next_genstamp"] = gs + 1
-            blocks[bid] = {
+            entry = {
                 "id": bid, "size": size, "checksum": checksum,
                 "genstamp": gs,
                 "desired": desired or config.DEFAULT_REPLICATION,
                 "created_at": now(),
                 "replicas": {},
             }
+            if enc_kid:
+                entry["encrypted"] = True
+                entry["enc_kid"] = enc_kid
+                entry["plain_checksum"] = plain_checksum
+                entry["plain_size"] = plain_size if plain_size is not None \
+                    else size
+            blocks[bid] = entry
             self.meta.touch("blocks")
             return bid, gs
 
     def register_existing_checksum(self, checksum):
-        """内容去重：同校验和的块已存在则直接复用（配合 CDC 分块更有效）。"""
+        """明文内容去重：同校验和的明文块已存在则直接复用。"""
         with self.meta.lock:
             blocks_doc = self.meta.get("blocks")
             bid = blocks_doc.get("by_checksum", {}).get(checksum)
             if bid and bid in blocks_doc["blocks"]:
                 blk = blocks_doc["blocks"][bid]
-                if self.live_good_replicas(blk):
+                if not blk.get("encrypted") and self.live_good_replicas(blk):
+                    return bid
+            return None
+
+    def register_existing_encrypted(self, kid, plain_checksum):
+        """
+        加密块去重：仅在「同一密钥版本 + 同一明文内容」时复用。
+        不同 kid（轮换后）不复用——新写入必须使用新当前密钥。
+        """
+        with self.meta.lock:
+            blocks_doc = self.meta.get("blocks")
+            index = blocks_doc.get("by_plain_kid", {})
+            bid = index.get(f"{kid}|{plain_checksum}")
+            if bid and bid in blocks_doc["blocks"]:
+                blk = blocks_doc["blocks"][bid]
+                if blk.get("enc_kid") == kid and self.live_good_replicas(blk):
                     return bid
             return None
 
@@ -800,26 +833,50 @@ class NameNode:
             self.meta.touch("blocks")
         self.check_block_health(bid)
 
-    def store_data_blocks(self, data, desired=None, author="system"):
+    def store_data_blocks(self, data, desired=None, author="system", path=None):
         """
-        通用写入：bytes -> 分块 -> 去重 -> 流水线复制 -> 返回块清单。
+        通用写入：bytes -> 分块 -> 去重 ->（命中加密域则逐块封包加密）->
+        流水线复制 -> 返回块清单。
         （上传完成 / 合并写回 / 种子数据共用）
+
+        加密在 NameNode 内完成：DataNode 收到并落盘的已是密文容器，
+        其磁盘文件无法直接读出明文。
         """
         desired = desired or config.DEFAULT_REPLICATION
         content_hash = sha256_bytes(data)
+        scope_path = self.keys.scope_of(path) if path else None
         chunks = chunking.chunk_bytes(data)
         block_ids = []
         dedup_hits = 0
+        enc_blocks = 0
         for ch in chunks:
-            reuse = self.register_existing_checksum(ch.checksum)
-            if reuse:
-                block_ids.append(reuse)
-                dedup_hits += 1
-                continue
-            bid, gs = self.allocate_block(ch.length, ch.checksum, desired)
-            targets = self.choose_targets(ch.length, desired)
-            result = self._pipeline_put(bid, ch.data, ch.checksum, gs, targets)
-            self._record_stored_replicas(bid, gs, ch.checksum, ch.length,
+            bid = None
+            blob = ch.data
+            enc_kid = None
+            if scope_path:
+                kid, _key = self.keys.current_key(scope_path)
+                bid = self.register_existing_encrypted(kid, ch.checksum)
+                if bid:
+                    block_ids.append(bid)
+                    dedup_hits += 1
+                    continue
+                blob = self.keys.seal_for_path(path, ch.data)[0]
+                enc_kid = kid
+            else:
+                bid = self.register_existing_checksum(ch.checksum)
+                if bid:
+                    block_ids.append(bid)
+                    dedup_hits += 1
+                    continue
+            blob_checksum = sha256_bytes(blob)
+            bid, gs = self.allocate_block(
+                len(blob), blob_checksum, desired,
+                plain_checksum=ch.checksum if enc_kid else None,
+                plain_size=ch.length if enc_kid else None,
+                enc_kid=enc_kid)
+            targets = self.choose_targets(len(blob), desired)
+            result = self._pipeline_put(bid, blob, blob_checksum, gs, targets)
+            self._record_stored_replicas(bid, gs, blob_checksum, len(blob),
                                          result["stored"])
             if not result["stored"]:
                 # 首节点就失败：标记块缺失，交给恢复队列重试
@@ -827,21 +884,33 @@ class NameNode:
                 self.log_event("ERROR", "block", "pipeline_failed", bid,
                                author, json.dumps(result["failed"])[:400])
             block_ids.append(bid)
+            if enc_kid:
+                enc_blocks += 1
         with self.meta.lock:
-            by_ck = self.meta.get("blocks").setdefault("by_checksum", {})
+            blocks_doc = self.meta.get("blocks")
+            by_ck = blocks_doc.setdefault("by_checksum", {})
+            by_pk = blocks_doc.setdefault("by_plain_kid", {})
             for ch, bid in zip(chunks, block_ids):
-                by_ck.setdefault(ch.checksum, bid)
+                blk = blocks_doc["blocks"].get(bid)
+                if blk and blk.get("encrypted"):
+                    by_pk.setdefault(
+                        f"{blk['enc_kid']}|{blk['plain_checksum']}", bid)
+                else:
+                    by_ck.setdefault(ch.checksum, bid)
             self.meta.touch("blocks", flush=False)
         manifest = chunking.build_manifest(chunks, total_size=len(data),
                                            content_hash=content_hash)
         return {"block_ids": block_ids, "content_hash": content_hash,
-                "manifest": manifest, "dedup_hits": dedup_hits}
+                "manifest": manifest, "dedup_hits": dedup_hits,
+                "encrypted": bool(scope_path), "enc_blocks": enc_blocks,
+                "scope": scope_path}
 
     def write_file_internal(self, path, data, author="admin", mime=None,
                             owner=None):
         """
         写文件（内部 API）：确保父目录存在 -> 存块 -> 建/覆盖 inode。
         path 为完整文件路径；data 可以是 bytes 或 str（按 UTF-8 编码）。
+        若 path 位于已启用加密的目录下，块在落盘前已被加密。
         """
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -853,7 +922,7 @@ class NameNode:
         mime = mime or guess_mime(name)
         with self.meta.lock:
             self.fs.mkdirs(dir_path, owner or author)
-            result = self.store_data_blocks(data, author=author)
+            result = self.store_data_blocks(data, author=author, path=path)
             inode = self.fs.create_file(dir_path, name, len(data),
                                         result["content_hash"],
                                         result["block_ids"], mime,
@@ -865,7 +934,8 @@ class NameNode:
                 "content_hash": result["content_hash"],
                 "block_ids": result["block_ids"],
                 "chunks": len(result["block_ids"]),
-                "dedup_hits": result["dedup_hits"]}
+                "dedup_hits": result["dedup_hits"],
+                "encrypted": result["encrypted"], "scope": result["scope"]}
 
     # ==================================================================
     # 读路径（副本轮询 + 故障转移）
@@ -883,6 +953,10 @@ class NameNode:
         """
         读一个块：存活好副本轮询，校验失败自动切换下一副本。
         返回 (data, block_meta, served_by)。
+
+        加密块：start/end 是**明文逻辑区间**。DataNode 只存密文容器，
+        因此整块取回 -> NameNode 透明解密 -> 本地切片；
+        解密后再与块表中的明文 sha256 比对（端到端完整性）。
         """
         if use_cache and start is None:
             cached = self.block_cache.get(bid)
@@ -892,6 +966,11 @@ class NameNode:
             blk = self._block_meta(bid)
         if not blk:
             raise MissingBlockError(f"块表中不存在: {bid}")
+        encrypted = bool(blk.get("encrypted"))
+        # 加密块不把 Range 透给 DataNode（容器头部 + nonce 使得密文偏移不等于
+        # 明文偏移）；整块密文取回后本地解密切片。
+        fetch_range = None if encrypted else (start, end)
+        want_slice = encrypted and start is not None
         candidates = self.live_good_replicas(blk)
         if not candidates:
             # 放宽：任何持有该块且存活的节点（读时校验兜底）
@@ -909,15 +988,31 @@ class NameNode:
         for nid in order:
             url = f"{self._node_url(nid).rstrip('/')}/block/{bid}"
             headers = {"X-Cluster-Key": self.cluster_key}
-            if start is not None:
-                headers["Range"] = f"bytes={start}-{end}"
+            if fetch_range is not None:
+                headers["Range"] = f"bytes={fetch_range[0]}-{fetch_range[1]}"
             try:
-                _s, _h, data = http_request(url, "GET", headers=headers,
+                _s, _h, blob = http_request(url, "GET", headers=headers,
                                             timeout=15)
-                if verify and start is None:
-                    actual = sha256_bytes(data)
-                    if actual != blk["checksum"]:
-                        raise NNError("校验和不匹配")
+                if encrypted:
+                    # 密文容器：HMAC 认证 + 透明解密
+                    from . import crypto as _crypto
+                    if not _crypto.is_encrypted_blob(blob):
+                        raise NNError("期望密文容器但读到裸数据")
+                    data, info = self.keys.open_blob(blob)
+                    if info.get("kid") != blk.get("enc_kid"):
+                        raise NNError("密文 kid 与块表记录不一致")
+                    if verify:
+                        actual = sha256_bytes(data)
+                        if actual != blk.get("plain_checksum"):
+                            raise NNError("解密后明文校验和不匹配")
+                    if want_slice:
+                        data = data[start:end + 1]
+                else:
+                    data = blob
+                    if verify and start is None:
+                        actual = sha256_bytes(data)
+                        if actual != blk["checksum"]:
+                            raise NNError("校验和不匹配")
                 if start is None and use_cache:
                     self.block_cache.put(bid, data)
                 return data, blk, nid
@@ -959,13 +1054,14 @@ class NameNode:
         nodes = []
         touched = 0
         pos = offset
-        # 逐块定位
+        # 逐块定位（加密块用明文大小映射逻辑偏移）
         block_starts = []
         acc = 0
         with self.meta.lock:
             for bid in block_ids:
                 blk = self._block_meta(bid)
-                bsize = (blk or {}).get("size", 0)
+                bsize = (blk or {}).get(
+                    "plain_size", (blk or {}).get("size", 0))
                 block_starts.append((bid, acc, bsize))
                 acc += bsize
         for bid, bstart, bsize in block_starts:
@@ -1006,6 +1102,10 @@ class NameNode:
             os.makedirs(stage_dir, exist_ok=True)
             piece = piece_size or config.UPLOAD_PIECE_SIZE
             total_pieces = max(1, (size + piece - 1) // piece) if size else 1
+            # 临时分片密钥：只保存在内存（不落盘、不入元数据）。
+            # 即使分片暂存目录被直接查看，磁盘上也只有密文。
+            from . import crypto as _crypto
+            sess_key = _crypto.generate_key()
             sess = {
                 "id": sess_id, "path": path, "filename": filename,
                 "size": size, "piece_size": piece,
@@ -1013,6 +1113,7 @@ class NameNode:
                 "received": {},            # idx -> {size, checksum, ts}
                 "user": user, "created_at": now(), "last_active": now(),
                 "stage_dir": stage_dir, "completed": False, "result": None,
+                "sess_key": sess_key,
             }
             self.sessions[sess_id] = sess
         self.log_event("INFO", "upload", "begin", f"{path}/{filename}", user,
@@ -1036,12 +1137,14 @@ class NameNode:
     def upload_chunk(self, session_id, index, data_b64, checksum=None,
                      simulate_fail=False):
         import base64
+        from . import crypto as _crypto
         with self.session_lock:
             sess = self.sessions.get(session_id)
             if not sess:
                 raise NNError("会话不存在或已过期")
             if sess["completed"]:
                 raise NNError("会话已完成")
+            sess_key = sess["sess_key"]
         # 混沌模式：服务端随机失败，演练前端重试
         flaky = simulate_fail or self.sim_chaos
         if flaky and random.random() < config.UPLOAD_FLAKY_RATE_CHAOS:
@@ -1058,7 +1161,9 @@ class NameNode:
             raise NNError(f"非法分片序号: {index}")
         piece_path = os.path.join(sess["stage_dir"], f"piece_{index:06d}")
         from .util import atomic_write_bytes
-        atomic_write_bytes(piece_path, data)     # 分片暂存也原子写
+        # 分片用会话临时密钥封包后原子落盘（kid 为会话 id）
+        sealed = _crypto.seal_block(data, sess_key, f"sess:{session_id}")
+        atomic_write_bytes(piece_path, sealed)
         with self.session_lock:
             sess["received"][str(index)] = {"size": len(data),
                                             "checksum": actual, "ts": now()}
@@ -1080,12 +1185,17 @@ class NameNode:
                               f"{missing[:10]}")
             if sess["completed"]:
                 return sess["result"]
-        # 读取全部分片 -> 拼接 -> 校验总大小
+        # 读取全部分片（密文容器）-> 临时密钥透明解密 -> 拼接 -> 校验总大小
+        from . import crypto as _crypto
         datas = []
         for i in range(sess["total_pieces"]):
             piece_path = os.path.join(sess["stage_dir"], f"piece_{i:06d}")
             with open(piece_path, "rb") as f:
-                datas.append(f.read())
+                sealed = f.read()
+            piece, _info = _crypto.open_block(
+                sealed, lambda kid, _k=sess["sess_key"]: _k
+                if kid == f"sess:{session_id}" else None)
+            datas.append(piece)
         data = b"".join(datas)
         if sess["size"] and len(data) != sess["size"]:
             raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
@@ -1153,13 +1263,19 @@ class NameNode:
             if inode["type"] != "file":
                 raise FsError(f"不是文件: {path}")
             blk_metas = [self._block_meta(b) for b in inode.get("block_ids", [])]
+        scope = self.keys.scope_of(path)
         return {
             "path": path, "name": inode["name"], "size": inode.get("size", 0),
             "content_hash": inode.get("content_hash"),
             "mime": inode.get("mime"),
+            "encrypted": bool(scope),
+            "scope": scope,
+            "encryption": ("落盘加密（DFSENC1）" if scope else None),
             "blocks": [{"id": b["id"], "size": b["size"],
                         "checksum": b["checksum"][:16],
                         "genstamp": b["genstamp"],
+                        "encrypted": bool(b.get("encrypted")),
+                        "kid": b.get("enc_kid"),
                         "replicas": sorted(b.get("replicas", {}).keys())}
                        for b in blk_metas if b],
         }
@@ -1590,6 +1706,7 @@ class NameNode:
             blocks_doc = self.meta.get("blocks")
             blocks = blocks_doc["blocks"]
             by_ck = blocks_doc.get("by_checksum", {})
+            by_pk = blocks_doc.get("by_plain_kid", {})
             to_delete = []
             for bid, blk in blocks.items():
                 if bid in refs:
@@ -1602,6 +1719,10 @@ class NameNode:
                 ck = blk.get("checksum")
                 if by_ck.get(ck) == bid:
                     by_ck.pop(ck, None)
+                if blk.get("encrypted"):
+                    pk = f"{blk.get('enc_kid')}|{blk.get('plain_checksum')}"
+                    if by_pk.get(pk) == bid:
+                        by_pk.pop(pk, None)
                 for nid in (blk.get("replicas") or {}):
                     self._enqueue_command(nid, {
                         "type": "delete", "block_id": bid,
@@ -1657,9 +1778,12 @@ class NameNode:
                     "id": bid,
                     "short": short_hash(bid.replace("blk_", ""), 8),
                     "size": blk["size"],
+                    "plain_size": blk.get("plain_size", blk["size"]),
                     "checksum": blk["checksum"][:16],
                     "genstamp": blk["genstamp"],
                     "desired": blk.get("desired"),
+                    "encrypted": bool(blk.get("encrypted")),
+                    "kid": blk.get("enc_kid"),
                     "live": len(live),
                     "status": ("missing" if not live else
                                "under" if len(live) < blk.get("desired", 3)
@@ -1683,3 +1807,209 @@ class NameNode:
             paths = [p for p, inode in self.fs.all_files()
                      if bid in inode.get("block_ids", [])]
         return paths
+
+    def reencrypt_path(self, path, author="admin"):
+        """
+        把已启用加密目录下的存量文件用**当前密钥**重新加密落盘
+        （读取透明解密旧块/明文块 -> 以新密文块重写 inode 引用）。
+        仅处理位于某加密域内、且尚有明文块的文件；已是密文且 kid 为当前
+        密钥版本的文件跳过（幂等）。
+        """
+        scope_path = self.keys.scope_of(path)
+        if not scope_path:
+            raise NNError(f"路径不在加密目录内: {path}")
+        kid, _key = self.keys.current_key(scope_path)
+        rewritten = skipped = failed = 0
+        retained_history = 0
+        for fpath, inode in self.fs.all_files():
+            if not (fpath == scope_path
+                    or fpath.startswith(scope_path.rstrip("/") + "/")):
+                continue
+            bids = inode.get("block_ids", [])
+            with self.meta.lock:
+                metas = [self._block_meta(b) for b in bids]
+            needs = any((not m) or (not m.get("encrypted"))
+                        or m.get("enc_kid") != kid for m in metas)
+            if not needs:
+                skipped += 1
+                continue
+            try:
+                data = self.read_blocks(bids)
+                # 先记录旧块（可能是明文块），重写成功后立即安全擦除，
+                # 不等待 GC 宽限期——敏感数据一旦被密文替换就不应在盘上残留。
+                info = self.write_file_internal(
+                    fpath, data, inode.get("owner", author),
+                    mime=inode.get("mime"))
+                old_bids = [b for b in bids if b not in info["block_ids"]]
+                # 但仍被历史提交/回收站/会话引用的旧块必须保留——
+                # 任何一份历史版本都不能因加密而失效。
+                refs = self.referenced_blocks()
+                purgeable = [b for b in old_bids if b not in refs]
+                retained_history += len(old_bids) - len(purgeable)
+                self.purge_blocks_immediate(purgeable)
+                rewritten += 1
+                self.log_event("INFO", "crypto", "reencrypt_file", fpath,
+                               author,
+                               f"用密钥 {kid} 重新加密（{info['chunks']} 块），"
+                               f"立即擦除无引用旧块 {len(purgeable)} 个"
+                               + (f"，保留历史版本块 {len(old_bids)-len(purgeable)} 个"
+                                  if len(old_bids) != len(purgeable) else ""))
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                self.log_event("ERROR", "crypto", "reencrypt_failed", fpath,
+                               author, str(e)[:200])
+        return {"scope": scope_path, "kid": kid, "rewritten": rewritten,
+                "skipped": skipped, "failed": failed,
+                "retained_history_blocks": retained_history}
+
+    def purge_blocks_immediate(self, bids):
+        """
+        立即从块表删除并命令所有持有节点擦除这些块（绕过 GC 宽限期）。
+        用于重加密替换：旧明文块不应在磁盘上有任何宽限残留。
+        """
+        if not bids:
+            return 0
+        deleted = 0
+        with self.meta.lock:
+            blocks_doc = self.meta.get("blocks")
+            blocks = blocks_doc["blocks"]
+            by_ck = blocks_doc.get("by_checksum", {})
+            by_pk = blocks_doc.get("by_plain_kid", {})
+            for bid in bids:
+                blk = blocks.pop(bid, None)
+                if not blk:
+                    continue
+                deleted += 1
+                ck = blk.get("checksum")
+                if by_ck.get(ck) == bid:
+                    by_ck.pop(ck, None)
+                if blk.get("encrypted"):
+                    pk = f"{blk.get('enc_kid')}|{blk.get('plain_checksum')}"
+                    if by_pk.get(pk) == bid:
+                        by_pk.pop(pk, None)
+                for nid in (blk.get("replicas") or {}):
+                    self._enqueue_command(nid, {
+                        "type": "delete", "block_id": bid,
+                        "reason": "重加密：旧块立即安全擦除"})
+                with self.health_lock:
+                    self.under_replicated.pop(bid, None)
+                    self.missing_blocks.discard(bid)
+            if deleted:
+                self.meta.touch("blocks")
+        return deleted
+
+    # ==================================================================
+    # 落盘加密验证（证明 DataNode 磁盘上确实不是明文）
+    # ==================================================================
+    def _raw_block_from_datanode(self, bid, nid):
+        """绕过 NameNode 解密，直接从 DataNode 取原始落盘字节。"""
+        url = f"{self._node_url(nid).rstrip('/')}/block/{bid}"
+        _s, _h, blob = http_request(
+            url, "GET", headers={"X-Cluster-Key": self.cluster_key},
+            timeout=15)
+        return blob
+
+    def verify_file_encryption(self, path):
+        """
+        对文件逐块做"落盘即密文"核验：
+          * 直接读 DataNode 上的原始字节（不经过 NameNode 解密层）；
+          * 期望看到 DFSENC1 容器（加密块）——且原始字节中不含明文特征串；
+          * 用对应密钥版本能成功通过 HMAC 认证并解出与文件一致的明文；
+          * 同一逻辑块的各副本原始字节逐字节一致（密文副本一致）。
+        未启用加密目录下的文件返回 encrypted=false（本就以明文存储）。
+        """
+        from . import crypto as _crypto
+        with self.meta.lock:
+            inode = self.fs.resolve(path)
+            if inode["type"] != "file":
+                raise FsError(f"不是文件: {path}")
+            block_ids = list(inode.get("block_ids", []))
+            file_hash = inode.get("content_hash")
+            scope_path = self.keys.scope_of(path)
+            blk_infos = [self._block_meta(b) for b in block_ids]
+        if not scope_path:
+            return {"path": path, "encrypted": False,
+                    "scope": None,
+                    "note": "该文件不在任何已启用加密的目录下，按明文存储"}
+        checks = []
+        plain_pieces = []
+        all_ok = True
+        leak_findings = []
+        for idx, (bid, blk) in enumerate(zip(block_ids, blk_infos)):
+            if not blk:
+                all_ok = False
+                checks.append({"index": idx, "block": bid, "ok": False,
+                               "error": "块表中不存在该块"})
+                continue
+            reps = self.live_good_replicas(blk)
+            if not reps:
+                reps = [nid for nid in (blk.get("replicas") or {})]
+            item = {"index": idx, "block": bid,
+                    "short": short_hash(bid.replace("blk_", ""), 8),
+                    "kid": blk.get("enc_kid"),
+                    "cipher_bytes": blk.get("size", 0),
+                    "plain_bytes": blk.get("plain_size", 0),
+                    "replicas_checked": [], "ok": True, "problems": []}
+            raw_blobs = {}
+            probe = os.path.basename(path).encode("utf-8")
+            for nid in reps:
+                try:
+                    blob = self._raw_block_from_datanode(bid, nid)
+                    raw_blobs[nid] = blob
+                    is_enc = _crypto.is_encrypted_blob(blob)
+                    rep_info = {"node": nid, "bytes": len(blob),
+                                "container": is_enc, "ok": is_enc}
+                    if not is_enc:
+                        rep_info["ok"] = False
+                        item["problems"].append(f"{nid}: 磁盘上不是密文容器")
+                    elif probe and probe in blob:
+                        # 密文容器里不应直接出现文件名等明文特征
+                        rep_info["ok"] = False
+                        item["problems"].append(
+                            f"{nid}: 密文中检出明文特征串（疑似泄露）")
+                        leak_findings.append(
+                            f"{item['short']}@{nid} 命中文件名特征")
+                    item["replicas_checked"].append(rep_info)
+                except Exception as e:  # noqa: BLE001
+                    item["ok"] = False
+                    item["problems"].append(f"取样失败 {nid}: {e}")
+                    item["replicas_checked"].append(
+                        {"node": nid, "ok": False, "error": str(e)[:120]})
+            # 副本一致性 + 解密正确性（取任一副本验证）
+            if raw_blobs:
+                first_nid, first_blob = next(iter(raw_blobs.items()))
+                for nid, blob in raw_blobs.items():
+                    if blob != first_blob:
+                        item["ok"] = False
+                        item["problems"].append(
+                            f"副本 {nid} 与 {first_nid} 的密文字节不一致")
+                try:
+                    plain, info = self.keys.open_blob(first_blob)
+                    if sha256_bytes(plain) != blk.get("plain_checksum"):
+                        item["ok"] = False
+                        item["problems"].append("解密后明文校验和不匹配")
+                    else:
+                        item["decrypt_ok"] = True
+                        plain_pieces.append(plain)
+                except Exception as e:  # noqa: BLE001
+                    item["ok"] = False
+                    item["problems"].append(f"解密/认证失败: {e}")
+            else:
+                item["ok"] = False
+                item["problems"].append("没有可取样的存活副本")
+            if not item["ok"]:
+                all_ok = False
+            checks.append(item)
+        content_ok = None
+        if plain_pieces and len(plain_pieces) == len(block_ids):
+            content_ok = sha256_bytes(b"".join(plain_pieces)) == file_hash
+        return {
+            "path": path, "encrypted": True, "scope": scope_path,
+            "algorithm": "HMAC-SHA256-CTR / DFSENC1 容器",
+            "all_ok": all_ok and content_ok is not False
+            and not leak_findings,
+            "content_roundtrip_ok": content_ok,
+            "leak_findings": leak_findings,
+            "blocks": checks,
+            "checked_at": now(),
+        }

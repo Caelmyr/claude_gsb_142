@@ -1,0 +1,85 @@
+{
+ "doc": "crypto",
+ "vv": {
+  "namenode": 6
+ },
+ "updated_at": 1790782022.6025362,
+ "data": {
+  "scopes": {
+   "/finance": {
+    "path": "/finance",
+    "enabled_at": 1790781913.1909046,
+    "enabled_by": "admin",
+    "current_kid": "kv_2a1a5a286b79",
+    "note": "薪资等敏感数据：落盘前加密（静态加密）",
+    "keys": [
+     {
+      "kid": "kv_7311ea33c4bc",
+      "version": 1,
+      "key_b64": "vgP3DH1JuNlOUJeIgYhUyPo951bFeCsoIoZQ28LUkaM=",
+      "fingerprint": "891d73748b19f3febb98c19880f35361",
+      "alg": "HMAC-SHA256-CTR",
+      "created_at": 1790781913.1909215,
+      "created_by": "admin",
+      "rotated_from": null,
+      "note": "初始密钥"
+     },
+     {
+      "kid": "kv_2a1a5a286b79",
+      "version": 2,
+      "key_b64": "k/6qLEGmYGCLcGI64njRQgpbRzfJ2/d1ixovl/6JO0s=",
+      "fingerprint": "fdbb76a453ec48b4d354bf662c2167c7",
+      "alg": "HMAC-SHA256-CTR",
+      "created_at": 1790781913.47364,
+      "created_by": "admin",
+      "rotated_from": "kv_7311ea33c4bc",
+      "note": "例行轮换（演示：旧密钥保留）"
+     }
+    ]
+   },
+   "/secrepo": {
+    "path": "/secrepo",
+    "enabled_at": 1790782022.5220547,
+    "enabled_by": "admin",
+    "current_kid": "kv_aae76f53149e",
+    "note": "history protection test",
+    "keys": [
+     {
+      "kid": "kv_786f6d0257ee",
+      "version": 1,
+      "key_b64": "H6S63+HvWa7MEE85lUbT+7kLNSdv5yFtWmrFqdv/5JM=",
+      "fingerprint": "b5845fc71f29fcb98d949705206fc6d4",
+      "alg": "HMAC-SHA256-CTR",
+      "created_at": 1790782022.522069,
+      "created_by": "admin",
+      "rotated_from": null,
+      "note": "初始密钥"
+     },
+     {
+      "kid": "kv_ca3428bb364c",
+      "version": 2,
+      "key_b64": "TiXsa51UF/E0T1Dh4goYCzcCLRodQ6dFoRC3uUpbMx0=",
+      "fingerprint": "93a1a304a61152ab3b55ba3d3b641e4e",
+      "alg": "HMAC-SHA256-CTR",
+      "created_at": 1790782022.5599492,
+      "created_by": "admin",
+      "rotated_from": "kv_786f6d0257ee",
+      "note": "rotation 1"
+     },
+     {
+      "kid": "kv_aae76f53149e",
+      "version": 3,
+      "key_b64": "xPI4ZNS1Z2f1F0rXzRL8b4DZ77e5YEcBicn4D1rt4dE=",
+      "fingerprint": "ecb55e8b0b04a08840694c96a904a728",
+      "alg": "HMAC-SHA256-CTR",
+      "created_at": 1790782022.6025324,
+      "created_by": "admin",
+      "rotated_from": "kv_ca3428bb364c",
+      "note": "rotation 2"
+     }
+    ]
+   }
+  },
+  "revels": []
+ }
+}

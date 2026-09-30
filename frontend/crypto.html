@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>加密安全 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .scope-path { font-family: var(--mono); color: var(--accent); }
+  .kvver { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px;
+           background: var(--panel-2); }
+  .kvver.current { border-color: rgba(47,191,113,.5); background: var(--ok-soft); }
+  .fp { font-family: var(--mono); font-size: 12px; letter-spacing: .3px; }
+  .verify-step { font-family: var(--mono); font-size: 12px; }
+  .lock-tag { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">加密安全</h1>
+        <div class="sub" id="page-sub">敏感目录落盘加密 · 密钥版本链与轮换 · 明文落盘验证</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn sm" id="btn-refresh">⟳ 刷新</button>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <div class="card">
+        <div class="card-title">工作原理
+          <span class="hint">加密/解密发生在 NameNode：DataNode 磁盘上只有 DFSENC1 密文容器，密钥永不下发到 DataNode</span>
+        </div>
+        <div class="grid cols-2" style="gap:10px;font-size:12.5px;color:var(--text-dim)">
+          <div>🔒 <b>写入：</b>块数据离开 NameNode 内存前按密钥加密（每块随机 nonce + HMAC 认证标签），DataNode 落盘即密文。</div>
+          <div>🔑 <b>读取：</b>NameNode 取回密文后按块头记录的密钥版本透明解密，下载/预览/版本页面无感知。</div>
+          <div>🔄 <b>轮换：</b>仅追加新版本密钥并原子切换；旧版本永久保留——旧文件旧密钥可读、新文件新密钥、历史版本不失效。</div>
+          <div>👁 <b>查看密钥：</b>完整密钥默认不可见，仅管理员二次确认口令后一次性展示，每次查看写入审计。</div>
+        </div>
+      </div>
+
+      <div id="no-perm" class="card" style="display:none">
+        <div class="empty"><div class="big">🔒</div>需要 admin 角色才能管理加密目录与密钥（你仍可查看只读摘要，若有路径读权限）</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">已启用加密的目录
+          <span class="hint">这些目录（含子目录）下的新文件落盘前加密</span>
+          <span class="spacer"></span>
+          <button class="btn sm primary" id="btn-enable">＋ 对目录启用加密</button>
+        </div>
+        <div id="scopes"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">落盘明文验证
+          <span class="hint">绕过解密层直接取样 DataNode 磁盘字节，证明确实读不到明文</span>
+        </div>
+        <div class="form-row" style="display:flex;gap:10px;align-items:flex-end">
+          <label class="fl" style="flex:1">文件路径
+            <input type="text" id="vf-path" value="/finance/payroll-q3.csv"
+                   placeholder="/finance/payroll-q3.csv"></label>
+          <button class="btn primary" id="btn-verify">验证落盘内容</button>
+        </div>
+        <div id="vf-out" style="margin-top:14px"></div>
+      </div>
+
+      <div class="card" id="revel-card">
+        <div class="card-title">密钥查看审计
+          <span class="hint">最近的完整密钥查看记录（只含操作者/原因，绝不含密钥本身）</span></div>
+        <div id="revels"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, modal, confirmDlg } = DFSVS;
+
+let overview = null;
+let canManage = false;
+
+// ------------------------------------------------------------------ 总览
+async function load() {
+  try {
+    overview = await api("GET", "/api/crypto/overview");
+    canManage = overview.can_manage;
+    document.getElementById("btn-enable").style.display = canManage ? "" : "none";
+    renderScopes();
+    if (canManage) loadRevels();
+    else document.getElementById("revel-card").style.display = "none";
+  } catch (e) {
+    if (e.status === 401) return;
+    toast(e.message, "bad");
+  }
+}
+
+function renderScopes() {
+  const box = document.getElementById("scopes");
+  const scopes = overview.scopes || [];
+  if (!scopes.length) {
+    box.innerHTML = `<div class="empty small">尚未对任何目录启用加密。点击右上角「对目录启用加密」。</div>`;
+    return;
+  }
+  box.innerHTML = scopes.map(s => `
+    <div class="kvver" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="font-size:16px">🔒</span>
+        <span class="scope-path" style="font-size:14px">${esc(s.path)}</span>
+        <span class="badge ok plain">当前 v${s.current_version}</span>
+        <span class="muted small">启用 ${fmtTs(s.enabled_at)} · ${esc(s.enabled_by)}</span>
+        <span class="spacer"></span>
+        ${canManage ? `
+          <button class="btn sm" data-act="reencrypt" data-path="${esc(s.path)}">♻ 存量重加密</button>
+          <button class="btn sm warn" data-act="rotate" data-path="${esc(s.path)}">🔄 轮换密钥</button>` : ""}
+      </div>
+      <div class="small muted" style="margin:6px 0 10px">${esc(s.note || "")}</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>版本</th><th>密钥指纹（SHA-256 摘要）</th><th>状态</th><th>用量</th><th>创建</th><th>说明</th>${canManage ? "<th>查看</th>" : ""}</tr></thead>
+        <tbody>
+          ${s.keys.map(k => `
+            <tr>
+              <td class="num">v${k.version}</td>
+              <td class="fp">${esc(k.fingerprint)}${k.is_current ? "" : ' <span class="muted">（已归档）</span>'}</td>
+              <td>${k.is_current ? '<span class="badge ok plain">● 当前</span>' : '<span class="badge dim plain">历史保留</span>'}</td>
+              <td class="small">${k.usage.blocks} 块 · 明文 ${fmtBytes(k.usage.plain_bytes)} · 密文 ${fmtBytes(k.usage.cipher_bytes)}</td>
+              <td class="small muted">${fmtTs(k.created_at)}<br>${esc(k.created_by)}</td>
+              <td class="small">${esc(k.note)}</td>
+              ${canManage ? `<td><button class="btn xs" data-act="reveal" data-scope="${esc(s.path)}" data-kid="${esc(k.kid)}" data-ver="v${k.version}">👁 查看密钥</button></td>` : ""}
+            </tr>`).join("")}
+        </tbody>
+      </table></div>
+    </div>`).join("");
+
+  box.querySelectorAll("[data-act]").forEach(b => {
+    const path = b.dataset.path;
+    if (b.dataset.act === "rotate") b.onclick = () => rotateScope(path);
+    if (b.dataset.act === "reencrypt") b.onclick = () => reencryptScope(path);
+    if (b.dataset.act === "reveal") b.onclick = () => revealKey(b.dataset.scope, b.dataset.kid, b.dataset.ver);
+  });
+}
+
+// ------------------------------------------------------------------ 启用
+document.getElementById("btn-enable").onclick = () => {
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <label class="fl" style="margin-bottom:10px">目录路径
+      <input type="text" id="en-path" value="/finance" placeholder="/finance"></label>
+    <label class="fl">备注
+      <input type="text" id="en-note" placeholder="例如：薪资/合同等敏感数据"></label>
+    <div class="small muted" style="margin-top:8px">
+      启用后该目录下<b>新写入</b>的文件自动加密；已有文件可在启用后用「存量重加密」立即转换。
+      加密标记不可关闭（密钥会永久保留，历史版本始终可读）。</div>`;
+  modal({
+    title: "对目录启用落盘加密", body, okText: "启用加密",
+    onOk: async (el) => {
+      const path = el.querySelector("#en-path").value.trim();
+      if (!path) { toast("请填写目录路径", "warn"); return false; }
+      try {
+        await api("POST", "/api/crypto/enable", { path, note: el.querySelector("#en-note").value });
+        toast(`已对 ${path} 启用加密`, "ok");
+        load();
+      } catch (e) { toast(e.message, "bad"); return false; }
+    }
+  });
+};
+
+// ------------------------------------------------------------------ 轮换
+function rotateScope(path) {
+  confirmDlg(
+    `轮换 ${path} 的数据密钥？\n\n旧密钥会永久保留：旧文件仍用旧密钥读取，轮换后写入的文件使用新密钥，期间没有任何读不出的窗口，历史版本也不会失效。`,
+    async () => {
+      try {
+        const r = await api("POST", "/api/crypto/rotate", { path, note: "控制台手动轮换" });
+        toast(`已轮换到 v${r.scope.current_version}，旧版本已保留`, "ok");
+        load();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+}
+
+async function reencryptScope(path) {
+  confirmDlg(
+    `用当前密钥重加密 ${path} 下的存量文件？\n\n仍是明文（或旧密钥）的文件会被读取后以当前密钥重新加密落盘；被替换的旧明文块立即从所有 DataNode 擦除（不等 GC 宽限期）。`,
+    async () => {
+      const out = document.getElementById("vf-out");
+      out.innerHTML = `<span class="muted small">正在重加密 ${path} …</span>`;
+      try {
+        const r = await api("POST", "/api/crypto/reencrypt", { path });
+        const retained = r.retained_history_blocks
+          ? `，保留历史版本块 ${r.retained_history_blocks} 个（旧明文，因历史提交仍引用）` : "";
+        toast(`重加密完成：重写 ${r.rewritten} 个，跳过 ${r.skipped} 个，失败 ${r.failed} 个${retained}`,
+              r.failed ? "warn" : "ok");
+        load();
+      } catch (e) { toast(e.message, "bad"); }
+    }, true);
+}
+
+// ------------------------------------------------------------------ 查看密钥（二次口令）
+function revealKey(scope, kid, ver) {
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <div class="small muted" style="margin-bottom:10px">
+      你正在查看 <b class="scope-path">${esc(scope)}</b> 的 <b>${esc(ver)}</b> 完整数据密钥。
+      请再次输入当前账号口令确认，本次查看将被审计记录。</div>
+    <label class="fl" style="margin-bottom:10px">账号口令
+      <input type="password" id="rv-pass" autocomplete="off" placeholder="再次输入你的登录口令"></label>
+    <label class="fl">查看原因（必填，留痕）
+      <input type="text" id="rv-reason" placeholder="例如：离线应急恢复 / 合规导出"></label>`;
+  modal({
+    title: "查看完整密钥（敏感操作）", body, okText: "显示密钥",
+    onOk: async (el) => {
+      const password = el.querySelector("#rv-pass").value;
+      const reason = el.querySelector("#rv-reason").value.trim();
+      if (!password) { toast("请输入口令", "warn"); return false; }
+      if (!reason) { toast("请填写查看原因", "warn"); return false; }
+      try {
+        const r = await api("POST", "/api/crypto/reveal",
+          { path: scope, kid, password, reason });
+        showSecret(r.secret);
+        loadRevels();
+      } catch (e) { toast(e.message, "bad"); return false; }
+    }
+  });
+}
+
+function showSecret(s) {
+  modal({
+    title: `完整密钥 · ${s.scope} v${s.version}`, wide: true, hideCancel: true, okText: "我已妥善保存",
+    body: `
+      <div class="small muted" style="margin-bottom:8px">此明文仅本次显示。请立即保存到密钥管理系统，不要通过聊天/邮件转发。</div>
+      <div class="kv">
+        <span class="k">算法</span><span class="v">${esc(s.alg)}</span>
+        <span class="k">kid</span><span class="v">${esc(s.kid)}</span>
+        <span class="k">指纹</span><span class="v">${esc(s.fingerprint)}</span>
+      </div>
+      <div style="margin:10px 0 4px" class="small muted">Base64（32 字节）</div>
+      <div class="fp" id="sec-b64" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;word-break:break-all">${esc(s.key_b64)}</div>
+      <div style="margin:10px 0 4px" class="small muted">Hex</div>
+      <div class="fp" id="sec-hex" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;word-break:break-all">${esc(s.key_hex)}</div>
+      <div class="btn-group" style="margin-top:10px">
+        <button class="btn sm" id="cp-b64">复制 Base64</button>
+        <button class="btn sm" id="cp-hex">复制 Hex</button>
+      </div>`,
+    onOk: () => {}
+  });
+  document.getElementById("cp-b64").onclick = () => {
+    navigator.clipboard?.writeText(document.getElementById("sec-b64").textContent);
+    toast("已复制 Base64", "ok");
+  };
+  document.getElementById("cp-hex").onclick = () => {
+    navigator.clipboard?.writeText(document.getElementById("sec-hex").textContent);
+    toast("已复制 Hex", "ok");
+  };
+}
+
+async function loadRevels() {
+  try {
+    const r = await api("GET", "/api/crypto/revels");
+    const box = document.getElementById("revels");
+    box.innerHTML = r.revels.length ? `<div class="table-wrap"><table class="tbl">
+      <thead><tr><th>时间</th><th>用户</th><th>目录</th><th>版本</th><th>原因</th></tr></thead>
+      <tbody>${r.revels.map(x => `<tr>
+        <td class="small">${fmtTs(x.ts)}</td><td>${esc(x.user)}</td>
+        <td class="scope-path">${esc(x.scope)}</td><td class="num">v${x.version}</td>
+        <td class="small">${esc(x.reason)}</td></tr>`).join("")}</tbody>
+    </table></div>` : `<div class="empty small">暂无密钥查看记录</div>`;
+  } catch (e) { /* 忽略 */ }
+}
+
+// ------------------------------------------------------------------ 落盘验证
+document.getElementById("btn-verify").onclick = async () => {
+  const path = document.getElementById("vf-path").value.trim();
+  const out = document.getElementById("vf-out");
+  if (!path) { toast("请输入文件路径", "warn"); return; }
+  out.innerHTML = `<span class="muted small">正在直接从 DataNode 取样原始字节（不解密）…</span>`;
+  try {
+    const r = await api("POST", "/api/crypto/verify", { path });
+    if (!r.encrypted) {
+      out.innerHTML = `<span class="badge dim plain">未加密</span>
+        <span class="small muted" style="margin-left:8px">${esc(r.note)}</span>`;
+      return;
+    }
+    const totalPlain = r.blocks.reduce((s, b) => s + b.plain_bytes, 0);
+    const totalCipher = r.blocks.reduce((s, b) => s + b.cipher_bytes, 0);
+    out.innerHTML = `
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        ${r.all_ok ? '<span class="badge ok">✓ 验证通过：落盘确为密文</span>'
+                   : '<span class="badge bad">✗ 验证发现问题</span>'}
+        <span class="small muted">${esc(r.algorithm)} · 加密域 <b class="scope-path">${esc(r.scope)}</b></span>
+        <span class="small">${r.blocks.length} 块 · 明文 ${fmtBytes(totalPlain)} → 密文 ${fmtBytes(totalCipher)}</span>
+        <span class="badge ${r.content_roundtrip_ok ? "ok" : "bad"} plain">解密往返 ${r.content_roundtrip_ok ? "一致" : "不一致"}</span>
+        ${r.leak_findings.length ? `<span class="badge bad plain">明文特征泄露 ${r.leak_findings.length}</span>` : '<span class="badge ok plain">未检出明文特征</span>'}
+      </div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>#</th><th>块</th><th>密钥版本 kid</th><th>密文/明文</th><th>HMAC 解密</th><th>各 DataNode 原始取样</th><th>问题</th></tr></thead>
+        <tbody>${r.blocks.map(b => `
+          <tr>
+            <td class="num">${b.index}</td>
+            <td class="mono small">${esc(b.short)}</td>
+            <td class="mono small">${esc((b.kid || "").slice(-8))}</td>
+            <td class="small">${fmtBytes(b.cipher_bytes)} / ${fmtBytes(b.plain_bytes)}</td>
+            <td>${b.decrypt_ok ? '<span class="badge ok plain">通过</span>' : '<span class="badge bad plain">失败</span>'}</td>
+            <td>${b.replicas_checked.map(rp =>
+              `<span class="badge plain ${rp.ok ? "ok" : "bad"}" title="${rp.bytes} 字节">${esc(rp.node)}:${rp.container ? "密文容器" : "非容器!"}</span>`).join(" ")}</td>
+            <td class="small" style="color:var(--bad)">${(b.problems || []).map(esc).join("；") || "—"}</td>
+          </tr>`).join("")}
+      </tbody></table></div>
+      <div class="small muted" style="margin-top:8px">验证方式：以集群内部身份直连 DataNode 读取原始 .dat 字节（NameNode 不做解密），
+        检查 DFSENC1 容器头、文件名字面特征、HMAC-SHA256 认证标签与解密后内容哈希。</div>`;
+  } catch (e) {
+    out.innerHTML = `<span class="badge bad plain">${esc(e.message)}</span>`;
+  }
+};
+
+document.getElementById("btn-refresh").onclick = load;
+
+initPage("crypto.html", "加密安全").then(load);
+</script>
+</body>
+</html>

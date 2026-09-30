@@ -10,9 +10,9 @@
 纯 Python（标准库，零第三方依赖）+ 原生 HTML/CSS/JS 实现的**教学级分布式文件系统**：
 模拟 HDFS 风格的 NameNode / DataNode 集群（节点间全 HTTP 通信），
 在其上叠加 Git 风格的版本控制（提交 / 分支 / 三方合并 / 检出），
-并提供 11 个页面的管理控制台。
+并提供 12 个页面的管理控制台（含**敏感目录落盘加密 + 密钥轮换**）。
 
-代码规模：**约 12,000 行**（后端 ~8,700 行 Python，前端 ~4,400 行 HTML/CSS/JS）。
+代码规模：**约 13,000 行**（后端 ~9,300 行 Python，前端 ~4,700 行 HTML/CSS/JS）。
 
 ---
 
@@ -43,19 +43,20 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 ---
 
-## 2. 前端页面（11 个，要求 10 个 + 仪表盘）
+## 2. 前端页面（12 个，要求 10 个 + 仪表盘）
 
 | 页面 | 文件 | 内容 |
 |---|---|---|
 | 仪表盘 | `index.html` | KPI / 容量水位 / 最近提交 / 事件流 / 热点 TOP |
-| 文件浏览 | `files.html` | 目录树 + 缩略图网格 + 面包屑 + 块/副本详情抽屉 + 文本预览 |
-| 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式）、Range 分段下载（断点续传、sha256 校验、副本命中统计） |
+| 文件浏览 | `files.html` | 目录树（**加密目录 🔒 标记**）+ 缩略图网格 + 面包屑 + 块/副本详情抽屉（含密文块标记）+ 文本预览 |
+| 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式；**分片暂存同样加密落盘**）、Range 分段下载（断点续传、sha256 校验、副本命中统计） |
 | 版本历史 | `versions.html` | 提交时间线（泳道）、分支管理、提交/合并/检出、冲突展示、文件级历史与回滚 |
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
 | 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
 | 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销 |
 | 权限设置 | `permissions.html` | 路径前缀 ACL 规则编辑器、默认策略、**判定轨迹测试器** |
+| 加密安全 | `crypto.html` | **已加密目录、各密钥版本指纹/用量、密钥轮换入口、查看密钥（二次口令）、落盘明文验证** |
 | 系统日志 | `logs.html` | 级别/来源/用户/关键字过滤、分页、展开详情、自动刷新、CSV 导出、清空 |
 | 回收站 | `recycle.html` | 保留期倒计时、恢复 / 彻底删除 / 清空 |
 
@@ -159,6 +160,31 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 * **锁序纪律**：全局固定 meta → node → health → cmd，
   心跳注册/复活等路径在锁外执行副作用，避免 ABBA 死锁。
 
+### 4.6 敏感文件落盘加密 + 密钥轮换（`crypto.py` / `keystore.py`）
+* **加密边界在 NameNode**：写入时块在 NN 内存中封包后才经流水线复制到
+  DataNode；DN 磁盘上的 `blocks/<blk>.dat` 是 `DFSENC1` 密文容器
+  （JSON 头记录 kid/nonce/HMAC 标签 + 密文），**密钥绝不下发到 DN**。
+  上传分片暂存目录 `data/sessions/` 同样用会话临时密钥（仅内存）封包。
+* **算法（零依赖，标准库）**：HMAC-SHA256 为核心的 CTR 流密码，
+  每块 16B 随机 nonce；HMAC-SHA256 认证标签防篡改/防错密钥。
+  块表对密文容器计 sha256（DN 静默损坏/副本一致性链路不变），
+  另存 `plain_checksum/plain_size/enc_kid` 供解密后端到端校验与逻辑 Range。
+* **读取透明**：NN 取回密文 → 按块头 `kid` 取对应版本密钥 → HMAC 校验 →
+  解密；加密块不透传 Range 给 DN（整块取回本地切片）。下载/预览/diff/版本无感。
+* **密钥轮换无停机窗口、历史不失效**：每目录一条**只增不删**的密钥版本链
+  （存 `crypto.json`，不进 DN 同步白名单，内部接口也拒绝导出）。
+  轮换 = 原子追加新版本并切 `current_kid`：旧块头记旧 kid 永远用旧密钥读，
+  新写用新密钥；块不可变 ⇒ 不存在"换了密钥读不出"的时刻，
+  全部历史提交快照同理永久可读。
+* **存量重加密**：启用加密后可把目录内明文/旧密钥块用当前密钥重写；
+  被替换且**无任何引用**的旧明文块立即从全部 DN 擦除（不等 GC 宽限期），
+  仍被历史提交引用的旧块保留（计数上报），保证历史版本不失效。
+* **密钥不明示**：常规接口只返回指纹/版本/用量；查看完整密钥须
+  `crypto_admin`（admin）且**再次输入口令 + 填写原因**，每次查看写审计。
+* **落盘验证**：`POST /api/crypto/verify` 以集群内部身份直连 DN 读取
+  **未经解密**的原始字节，断言：是 DFSENC1 容器、无文件名等明文特征、
+  HMAC 通过、解密后内容哈希一致、各副本密文逐字节一致。
+
 ---
 
 ## 5. REST API 摘要（节选）
@@ -178,6 +204,9 @@ GET  /api/stats/overview|hotness|timeline
 GET|POST /api/users  PUT|DELETE /api/users/<name>      （user_admin）
 GET|POST /api/perms  PUT|DELETE /api/perms/<id>        （perm_admin）
 POST /api/perms/check
+GET  /api/crypto/overview|scope       POST /api/crypto/verify
+POST /api/crypto/enable|rotate|reencrypt|reveal        （crypto_admin）
+GET  /api/crypto/revels                                （crypto_admin）
 GET  /api/logs|logs/export       POST /api/logs/clear  （admin）
 GET  /api/recycle                POST /api/recycle/restore|purge|empty
 POST /internal/heartbeat|block_report      GET /internal/meta/<doc>   （集群密钥）
@@ -197,14 +226,16 @@ gsb4/
 │   ├── diff_engine.py         # Myers / Patience / merge3 / 渲染器
 │   ├── metadata.py            # JSON 文档仓库（原子写 + vv 同步语义）
 │   ├── auth.py                # 用户/口令/会话 + 路径 ACL
+│   ├── crypto.py              # DFSENC1：HMAC-CTR 封包/解封（仅标准库）
+│   ├── keystore.py            # 加密目录 + 密钥版本链/轮换/明文查看审计
 │   ├── filesystem.py          # inode 树 + 回收站
 │   ├── versioning.py          # 提交/分支/合并/检出/GC 引用集
-│   ├── namenode.py            # 块表/放置/心跳/恢复/上传下载/统计/GC
+│   ├── namenode.py            # 块表/放置/心跳/恢复/上传下载/统计/GC/加解密读写
 │   ├── datanode.py            # 块存储/心跳/汇报/scrub/流水线/文档同步
 │   ├── http_server.py         # 路由 + 静态页 + 鉴权中间件
-│   ├── seed.py                # 演示数据（含冲突合并场景）
+│   ├── seed.py                # 演示数据（含 /finance 落盘加密 + 轮换场景）
 │   └── main.py                # 集群装配
-├── frontend/                  # 11 页面 + css/app.css + js/app.js
+├── frontend/                  # 12 页面（含 crypto.html）+ css/app.css + js/app.js
 └── tests/smoke_test.py        # 97 项端到端断言
 ```
 

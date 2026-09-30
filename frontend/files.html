@@ -72,10 +72,23 @@ const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, modal, confirmDlg, promptDlg,
 let currentPath = DFSVS.qs("path", "/");
 let selected = null;      // 当前选中条目
 let expanded = new Set(["/"]);
+let encryptedPaths = [];  // 已启用加密的目录
+
+function scopeOf(path) {
+  // 最长前缀匹配
+  let best = null;
+  for (const sp of encryptedPaths) {
+    if (path === sp || path.startsWith(sp.replace(/\/$/, "") + "/")) {
+      if (!best || sp.length > best.length) best = sp;
+    }
+  }
+  return best;
+}
 
 // ------------------------------------------------------------------ 目录树
 async function loadTree() {
   const data = await api("GET", "/api/fs/tree");
+  encryptedPaths = data.encrypted_paths || [];
   const box = document.getElementById("tree");
   box.innerHTML = "";
   box.appendChild(buildTreeNode(data.tree, "/"));
@@ -89,10 +102,13 @@ function buildTreeNode(node, path) {
   row.className = "t-node" + (path === currentPath ? " sel" : "");
   const isDir = node.type === "dir";
   const isOpen = expanded.has(path);
+  const lock = isDir && encryptedPaths.includes(path)
+    ? '<span class="lock-tag" title="该目录已启用落盘加密">🔒</span>' : "";
   row.innerHTML = `
     <span class="tw">${isDir ? (isOpen ? "▾" : "▸") : ""}</span>
     <span>${isDir ? (isOpen ? "🗂" : "🗀") : fileIcon(node)}</span>
     <span class="tn">${esc(node.name)}</span>
+    ${lock}
     <span class="ts">${isDir ? (node.file_count ?? "") : fmtBytes(node.size)}</span>`;
   row.onclick = (e) => {
     e.stopPropagation();
@@ -151,6 +167,8 @@ function renderGrid(items) {
   grid.innerHTML = items.map((it, i) => `
     <div class="fcard ${selected && selected.path === it.path ? "sel" : ""}" data-i="${i}">
       ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="副本健康: ${it.health || "ok"}"></span>` : ""}
+      ${it.encrypted_scope ? `<span class="lock-tag" style="position:absolute;top:6px;left:8px;z-index:2"
+          title="位于加密目录 ${esc(it.encrypted_scope)}（${it.type === "file" ? (it.fully_encrypted ? "已加密落盘" : "启用前旧文件·未加密") : "落盘加密"}）">🔒</span>` : ""}
       <div class="thumb">
         ${it.thumb ? `<img loading="lazy" src="${esc(thumbUrl(it.path))}" alt="" onerror="this.parentElement.textContent='🖼'">` : fileIcon(it)}
       </div>
@@ -199,6 +217,10 @@ async function selectEntry(it) {
             <span class="k">类型</span><span class="v">${s.type === "dir" ? "目录" : esc(s.mime || "文件")}</span>
             <span class="k">大小</span><span class="v">${fmtBytes(s.size)}（${s.size} B）</span>
             <span class="k">内容哈希</span><span class="v">${esc((s.content_hash || "-").slice(0, 24))}…</span>
+            <span class="k">落盘加密</span><span class="v">${s.encrypted_scope
+                ? (s.fully_encrypted ? `🔒 已加密（域 ${esc(s.encrypted_scope)}，读取时透明解密）`
+                  : `🔸 位于加密域 ${esc(s.encrypted_scope)}，但此文件启用前已存在（块仍为明文）`)
+                : "未启用"}</span>
             <span class="k">属主 / 模式</span><span class="v">${esc(s.owner)} · ${esc(s.mode)}</span>
             <span class="k">创建 / 修改</span><span class="v">${fmtTs(s.created_at)} · ${fmtTs(s.modified_at)}</span>
             <span class="k">覆盖版本</span><span class="v">v${s.file_version}</span>
@@ -223,9 +245,9 @@ async function selectEntry(it) {
                 <tr><td class="mono">${esc(b.id.slice(-8))}</td><td colspan="4"><span class="badge bad">块丢失</span></td></tr>` : `
                 <tr>
                   <td class="mono" title="${esc(b.id)}\nsha256 ${esc(b.checksum)}…">${esc(b.short)}</td>
-                  <td class="num right">${fmtBytes(b.size)}</td>
+                  <td class="num right">${fmtBytes(b.size)}${b.encrypted ? ` <span class="muted small">/明 ${fmtBytes(b.plain_size)}</span>` : ""}</td>
                   <td class="num">#${b.genstamp}</td>
-                  <td>${healthBadge(b.status)} <span class="mono small">${b.live}/${b.desired}</span></td>
+                  <td>${b.encrypted ? `<span class="badge warn plain" title="${esc(b.kid || "")}">🔒密文</span> ` : ""}${healthBadge(b.status)} <span class="mono small">${b.live}/${b.desired}</span></td>
                   <td>${b.replicas.map(r => `
                     <span class="badge plain ${r.state === "ok" && r.live ? "ok" : r.state === "corrupt" ? "bad" : "warn"}"
                           title="genstamp #${r.genstamp} · ${r.rack || ""}">${esc(r.node)}${r.state !== "ok" ? ":" + esc(r.state) : ""}</span>`).join(" ") || '<span class="muted">无</span>'}</td>

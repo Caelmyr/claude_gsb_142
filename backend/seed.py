@@ -26,6 +26,11 @@ def is_seeded(nn):
         return bool(nn.meta.get("cluster").get(SEEDED_FLAG))
 
 
+def _reencrypt_existing(nn, path):
+    """启用加密后把目录内存量明文文件用当前密钥重新加密落盘。"""
+    return nn.reencrypt_path(path, "admin")
+
+
 def mark_seeded(nn):
     with nn.meta.lock:
         nn.meta.get("cluster")[SEEDED_FLAG] = now()
@@ -368,6 +373,13 @@ def seed_cluster(nn, datanodes=None, verbose=True):
         nn.write_file_internal(path, data, author)
     say(f"  写入 {len(files_v1)} 个文件")
 
+    # 落盘加密：薪资目录启用加密。该目录下已写入的块随后会重新加密落盘，
+    # 确保演示环境里 DataNode 磁盘上的薪资数据确实不可直接读懂。
+    nn.keys.enable_scope("/finance", "admin",
+                         "薪资等敏感数据：落盘前加密（静态加密）")
+    _reencrypt_existing(nn, "/finance")
+    say("  /finance 已启用落盘加密并完成存量重加密")
+
     say("构建版本历史 …")
     nn.versions.commit("init: 初始化仓库（文档/代码/数据/图片）", "admin")
 
@@ -428,6 +440,17 @@ def seed_cluster(nn, datanodes=None, verbose=True):
 
     say("生成历史访问热度与吞吐数据 …")
     _seed_stats(nn)
+
+    # 密钥轮换演示：旧文件（payroll）由 v1 密钥加密且保持可读，
+    # 轮换后新写入的文件使用 v2 密钥——历史版本不失效、无切换窗口。
+    nn.keys.rotate("/finance", "admin", "例行轮换（演示：旧密钥保留）")
+    nn.write_file_internal(
+        "/finance/bonus-plan.txt",
+        ("# 季度奖金方案（轮换后新文件，使用新版密钥加密）\n\n"
+         "本文件在密钥轮换之后写入，落盘块头记录新的 kid；\n"
+         "同目录旧文件仍由旧版本密钥加密，读取时按块头自动选择密钥。\n").encode(),
+        "admin")
+    say("  /finance 完成一次密钥轮换并写入轮换后新文件")
 
     say("注入历史日志 …")
     _seed_logs(nn)
